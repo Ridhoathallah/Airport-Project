@@ -30,11 +30,32 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import yaml
+
+try:  # Mapping schema lives next to this module when running inputs.
+    from mapping import (  # type: ignore
+        BOTTOM_CENTER_REFERENCE,
+        CENTROID_REFERENCE,
+        MappingGeometry,
+        MappingError,
+        is_simple_polygon,
+        to_pixel as mapping_to_pixel,
+        validate_mapping as validate_mapping_geometry,
+    )
+    _MAPPING_AVAILABLE = True
+except ImportError:  # pragma: no cover - defensive imports
+    _MAPPING_AVAILABLE = False
+    MappingGeometry = None
+    MappingError = ValueError
+    BOTTOM_CENTER_REFERENCE = "bottom_center"
+    is_simple_polygon = None
+    mapping_to_pixel = None
+    validate_mapping_geometry = None
+    CENTROID_REFERENCE = "centroid"
 
 # Camera prototype states (a subset of the future sensor-fusion states).
 EMPTY = "EMPTY"
@@ -48,6 +69,21 @@ SEVERE_STATES = (CONGESTED, BACKLOG)
 
 BACKLOG_UNAVAILABLE_MSG = "BACKLOG CHECK UNAVAILABLE - FLOW BASELINE NOT CONFIGURED"
 PIXEL_DENSITY_LABEL = "PIXEL DENSITY - UNCALIBRATED"
+
+# Crossing events are suppressed for this many consecutive frames after a
+# track crosses a line, so jitter right next to a line produces exactly one
+# event instead of a burst. Tuned for the 15-30 fps monitoring feeds this
+# prototype runs at, and deliberately separate from
+# `classifier.debounce_frames` (which is the state-machine anti-flapping
+# knob and must keep that meaning).
+#
+# Semantics: `crossing_debounce_frames` is the number of *consecutive
+# frames* a track must be observed on the far side of a counting line
+# before the crossing is committed and becomes an event:
+#   1 -> fires on the frame the side first changes (pre-mapping behaviour)
+#   2 -> one additional stable frame, which filters 1-frame jitter
+#   3 -> two stable frames, for noisy tracking feeds
+DEFAULT_CROSSING_DEBOUNCE_FRAMES = 2
 
 # Status colours (BGR) — distinct per state, bright enough on dark panels.
 # EMPTY stays grey/blue, SPARSE/NORMAL are green, CROWDED yellow,
@@ -126,6 +162,28 @@ def _line_side(a, b, px: float, py: float) -> float:
     return (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0])
 
 
+def _side_int(a, b, p) -> int:
+    """``_line_side`` reduced to a strict ``-1`` / ``0`` / ``+1`` sign."""
+    s = _line_side(a, b, float(p[0]), float(p[1]))
+    if s == 0.0:
+        return 0
+    return 1 if s > 0 else -1
+
+
+def reference_xy(box, reference_point: str = CENTROID_REFERENCE) -> Tuple[float, float]:
+    """The tracking reference point of a ``(x1, y1, x2, y2)`` bbox.
+
+    ``bottom_center`` (the calibrated default for overhead and
+    high-angle cameras: the bottom of the box is the closest estimator
+    of the real footprint on the ground) or ``centroid`` (the legacy
+    behaviour, retained as a configurable compatibility fallback).
+    """
+    x1, y1, x2, y2 = (float(v) for v in box)
+    if reference_point == BOTTOM_CENTER_REFERENCE and _MAPPING_AVAILABLE:
+        return (x1 + x2) / 2.0, y2
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
 def _segment_crosses_line(p1, p2, a, b) -> bool:
     """True if segment p1->p2 crosses the infinite line through a, b."""
     s1 = _line_side(a, b, p1[0], p1[1])
@@ -152,6 +210,23 @@ class CameraConfig:
     roi: Optional[list] = None
     counting_line: Optional[list] = None
     xray_side_point: Optional[list] = None
+
+    # ── Mapping (the single active geometry source when valid) ─────
+    # Loaded from config/mappings.yaml, keyed by `camera_id`.
+    # When set, `roi` / `counting_line` / `xray_side_point` above are
+    # IGNORED — see `_mapping_pixel()` in QueueAnalytics.
+    mapping: Optional["MappingGeometry"] = None
+    # Tracking reference point. ``None`` means "not set in camera.yaml",
+    # in which case the mapping's own ``reference_point`` decides
+    # (``bottom_center`` for new mappings, ``centroid`` for legacy).
+    reference_point: Optional[str] = None
+    # Per-track/per-line crossing deduplication (frames of stability
+    # required before an event can fire). Separate knob from the
+    # classifier's `debounce_frames`; see DEFAULT_CROSSING_DEBOUNCE_FRAMES.
+    crossing_debounce_frames: int = DEFAULT_CROSSING_DEBOUNCE_FRAMES
+    # Where the active mapping came from: "mappings.yaml", "legacy"
+    # (derived in-memory from camera.yaml geometry) or "none".
+    mapping_source: str = "none"
 
     queue_capacity: int = 30
     flow_windows_minutes: list = field(default_factory=lambda: [1, 5])
@@ -205,11 +280,40 @@ class CameraConfig:
 
     @property
     def roi_configured(self) -> bool:
+        """True when the ROI polygon is usable for analytics.
+
+        The active mapping counts, because it is the single geometry
+        source; the legacy ``config.roi`` only matters when no mapping
+        is loaded.
+        """
+        if self.mapping_active and self.mapping.roi:
+            return True
         return bool(self.roi and len(self.roi) >= 3 and _polygon_area_px(self.roi) > 0)
 
     @property
     def line_configured(self) -> bool:
+        """True when at least one counting line is usable."""
+        if self.mapping_active and self.mapping.lines:
+            return True
         return bool(self.counting_line and len(self.counting_line) == 2 and self.xray_side_point)
+
+    @property
+    def mapping_active(self) -> bool:
+        """True when a valid mapping is loaded and drives the geometry."""
+        return _MAPPING_AVAILABLE and (self.mapping is not None) and bool(self.mapping.lines)
+
+    @property
+    def geometry_configured(self) -> bool:
+        """True when the ROI and at least one counting line are usable.
+
+        Identical to the pre-mapping definition when no mapping is
+        loaded, and the mapping-driven definition afterwards, so callers
+        downstream of the pipeline do not have to branch on the mapping
+        to know whether analytics can run.
+        """
+        if self.mapping_active:
+            return True
+        return self.roi_configured and self.line_configured
 
     @property
     def calibrated(self) -> bool:
@@ -268,6 +372,14 @@ class CameraConfig:
             dashboard_panel_width=int(dash.get("panel_width", 360)),
             dashboard_chart_history=int(dash.get("chart_history", 120)),
             recommendations=dict(rec),
+            reference_point=str(
+                data.get("mapping", {}).get("reference_point", "") or ""
+            ).lower() or None,
+            crossing_debounce_frames=int(
+                data.get("mapping", {}).get("crossing_debounce_frames",
+                                            DEFAULT_CROSSING_DEBOUNCE_FRAMES)
+                or DEFAULT_CROSSING_DEBOUNCE_FRAMES
+            ),
         )
 
     def to_dict(self) -> dict:
@@ -356,13 +468,103 @@ class CameraConfig:
 
 
 def load_camera_config(path) -> CameraConfig:
-    """Load a camera config; returns defaults if the file is missing."""
+    """Load a camera config; returns defaults if the file is missing.
+
+    Mapping resolution order (the mapping is the single active geometry
+    source when one is valid):
+
+      1. ``config/mappings.yaml`` entry for ``camera_id``  → mapping
+      2. legacy ``camera.yaml`` ROI + counting_line + xray_side_point
+         → derived mapping (in-memory only, never persisted back)
+
+    If the loaded mapping fails validation, the pipeline falls back to
+    legacy geometry and records why, so a broken mapping can never
+    silently blank the analytics.
+    """
     path = Path(path)
     if not path.exists():
         return CameraConfig(path=path)
     with open(path) as f:
         data = yaml.safe_load(f) or {}
-    return CameraConfig.from_dict(data, path=path)
+    config = CameraConfig.from_dict(data, path=path)
+    return _resolve_camera_mapping(config, mapping_path=None)
+
+
+def _resolve_camera_mapping(config: "CameraConfig", mapping_path=None) -> "CameraConfig":
+    """Attach a validated mapping to ``config``.
+
+    Loads it from ``mappings.yaml`` when present, otherwise derives one
+    from the legacy ``counting_line`` + ``xray_side_point`` geometry.
+    Invalid mappings are dropped (with a log line) so that the analytics
+    engine keeps running the previous geometry instead of blanking.
+    """
+    if not _MAPPING_AVAILABLE:
+        return config
+    if mapping_path is None:
+        try:
+            from mapping import default_mappings_path
+            mapping_path = default_mappings_path(config.path)
+        except Exception:
+            mapping_path = None
+    try:
+        from mapping import load_mapping, from_legacy_camera_config
+    except ImportError:
+        return config
+
+    camera_id = config.camera_id or "CAMERA 01"
+    shape = None
+    if config.source_shape_w and config.source_shape_h:
+        shape = (int(config.source_shape_w), int(config.source_shape_h))
+
+    mapping = None
+    source = "legacy camera.yaml geometry"
+    if mapping_path is not None:
+        try:
+            mapping = load_mapping(Path(mapping_path), camera_id=camera_id)
+        except MappingError as exc:
+            print(f"[WARN] mappings.yaml unusable, ignoring: {exc}")
+            mapping = None
+        if mapping is not None:
+            source = f"{Path(mapping_path).name}"
+
+    if mapping is None and config.roi_configured and config.line_configured and shape:
+        # Legacy fallback: derive an in-memory mapping, never persisted.
+        mapping = from_legacy_camera_config(
+            config.roi,
+            config.counting_line,
+            config.xray_side_point,
+            shape=shape,
+            camera_id=camera_id,
+            reference_point=CENTROID_REFERENCE,
+        )
+
+    if mapping is None:
+        config.mapping_source = "none"
+        config.mapping = None
+        return config
+
+    errors = validate_mapping_geometry(mapping, shape=mapping.source_shape)
+    if errors:
+        print(
+            f"[WARN] mapping {camera_id!r} from {source} is invalid and inactive: "
+            + "; ".join(errors)
+        )
+        config.mapping = None
+        config.mapping_source = "none"
+        return config
+
+    if config.reference_point:
+        # camera.yaml explicitly sets it (compatibility switch); the
+        # mapping's own value only applies when camera.yaml does not.
+        mapping.reference_point = config.reference_point
+    config.mapping = mapping
+    config.mapping_source = "legacy" if source.startswith("legacy") else "mappings.yaml"
+    print(
+        f"[INFO] mapping {camera_id!r} active from {source} — "
+        f"roi={len(mapping.roi)}pt, lines={sorted(mapping.lines)}, "
+        f"ref={mapping.reference_point}"
+    )
+    return config
 
 
 # ---------------------------------------------------------------------
@@ -398,6 +600,34 @@ class EventLog:
 
 
 @dataclass
+class _TrackLineState:
+    """Per-track, per-line crossing state.
+
+    ``side`` is the last committed half-plane side of the track relative
+    to the line (``+1`` / ``-1`` for the two sides, ``0`` until the first
+    observation). ``pending_side`` and ``pending_frames`` accumulate a
+    candidate crossing until the track has been on the new side for
+    ``crossing_debounce_frames`` consecutive frames — that is what makes
+    jitter next to a line produce a single event instead of a burst.
+    """
+
+    side: int = 0
+    pending_side: int = 0
+    pending_frames: int = 0
+    last_event_unix: Optional[float] = None
+    last_direction: Optional[str] = None
+    reverse_events: int = 0
+
+    def reset(self) -> None:
+        self.side = 0
+        self.pending_side = 0
+        self.pending_frames = 0
+        self.last_event_unix = None
+        self.last_direction = None
+        self.reverse_events = 0
+
+
+@dataclass
 class PersonState:
     track_id: int
     first_seen_unix: float
@@ -413,6 +643,11 @@ class PersonState:
     inside_roi: bool = False
     crossed_line: bool = False
     conf: float = 0.0
+    # Per-line crossing state, keyed by line id ("in" / "out" / "legacy").
+    line_states: Dict[str, _TrackLineState] = field(default_factory=dict)
+    # The reference point actually used for the last crossing/ROI test —
+    # kept alongside ``centroid`` so geometry regressions are visible.
+    last_ref_point: Tuple[float, float] = (0.0, 0.0)
 
 
 # ---------------------------------------------------------------------
@@ -620,6 +855,88 @@ class QueueAnalytics:
         self._prev_state = UNCONFIGURED
         self._state_start_unix: Optional[float] = None
         self.occupancy_series: deque = deque()
+        # Resolved per-frame geometry (ROI in native pixels, counting
+        # lines in native pixels, tracking reference point). Recomputed
+        # on the first track of the frame, cached for the rest of it, so
+        # ROI membership and crossings always use the same coordinates.
+        self._geom_cache_shape: Optional[Tuple[int, int]] = None
+        self._geom_cache: Optional[dict] = None
+
+    # ── resolved geometry (single active source of truth) ─────
+
+    def _geometry_for_shape(self, shape: Tuple[int, int]) -> dict:
+        """Resolve the ROI polygon and counting lines for one frame.
+
+        Returns ``{"roi": [(x, y) ...], "lines": {id: (a, b, direction)},
+        "ref": "bottom_center"|"centroid", "configured": bool}``.
+
+        A valid mapping is the single active geometry source: when one
+        is loaded, the legacy ``config.roi`` / ``config.counting_line`` /
+        ``config.xray_side_point`` are ignored entirely. When no mapping
+        is loaded the legacy geometry is used with the legacy semantics
+        (crossing towards ``xray_side_point`` = EXIT, away = ENTER) and
+        the centroid reference point, exactly as before this refactor.
+
+        Results are cached per-frame SHAPE, so repeated calls inside the
+        same frame (one per track) never re-run the conversion.
+        """
+        w, h = shape
+        if w <= 0 or h <= 0:
+            return {"roi": (), "lines": {},
+                    "ref": self.config.reference_point or CENTROID_REFERENCE,
+                    "configured": False}
+        if self._geom_cache_shape == shape and self._geom_cache is not None:
+            return self._geom_cache
+
+        cfg = self.config
+        if cfg.mapping_active and MappingGeometry is not None:
+            try:
+                pix = mapping_to_pixel(cfg.mapping, (w, h))
+                lines = {}
+                if pix.in_line is not None:
+                    lines["in"] = (pix.in_line[0], pix.in_line[1], pix.in_direction or "IN")
+                if pix.out_line is not None:
+                    lines["out"] = (pix.out_line[0], pix.out_line[1], pix.out_direction or "OUT")
+                resolved = {
+                    "roi": tuple(pix.roi),
+                    "lines": lines,
+                    "ref": pix.reference_point,
+                    "configured": bool(pix.roi) and bool(lines),
+                }
+                self._geom_cache_shape = (w, h)
+                self._geom_cache = resolved
+                return resolved
+            except MappingError:
+                pass  # fall through to the legacy geometry below
+
+        # ── legacy path, semantics unchanged ─────────────────
+        roi = tuple((float(x), float(y)) for x, y in (cfg.roi or ()))
+        lines = {}
+        if cfg.counting_line and len(cfg.counting_line) == 2 and cfg.xray_side_point:
+            a = (float(cfg.counting_line[0][0]), float(cfg.counting_line[0][1]))
+            b = (float(cfg.counting_line[1][0]), float(cfg.counting_line[1][1]))
+            side = (float(cfg.xray_side_point[0]), float(cfg.xray_side_point[1]))
+            # Legacy semantics: crossing *towards* `xray_side_point` is an
+            # EXIT, away from it is an ENTER. `out` therefore must carry
+            # its positive half-plane on the X-ray side. Which ordering
+            # that is depends on the geometry (horizontal or vertical
+            # line), so derive it from the sign of `_line_side` at the
+            # X-ray point instead of assuming an orientation:
+            if _line_side(a, b, side[0], side[1]) >= 0:
+                lines["out"] = (a, b, "OUT")
+                lines["in"] = (b, a, "IN")
+            else:
+                lines["out"] = (b, a, "OUT")
+                lines["in"] = (a, b, "IN")
+        resolved = {
+            "roi": roi,
+            "lines": lines,
+            "ref": CENTROID_REFERENCE,
+            "configured": (len(roi) >= 3) and bool(lines),
+        }
+        self._geom_cache_shape = (w, h)
+        self._geom_cache = resolved
+        return resolved
 
     # ── per-frame entry point ────────────────────────────────
 
@@ -628,6 +945,9 @@ class QueueAnalytics:
         now_iso = iso_from_unix(now_unix)
         self.frame_count += 1
         h, w = shape
+        self._geom_cache_shape = None  # invalidate per-frame geometry cache
+        self._geom_cache = None
+        self._geom_cache_shape = (int(w), int(h))
         events = []
         track_confs = track_confs or {}
 
@@ -641,6 +961,9 @@ class QueueAnalytics:
             cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
             centroids[tid] = (cx, cy)
 
+            geom = self._geometry_for_shape((w, h))
+            ref_point = reference_xy((x1, y1, x2, y2), geom["ref"])
+
             ps = self.persons.get(tid)
             if ps is None:
                 ps = PersonState(track_id=tid, first_seen_unix=now_unix, first_seen_iso=now_iso)
@@ -648,10 +971,11 @@ class QueueAnalytics:
             ps.last_seen_unix = now_unix
             ps.conf = track_confs.get(tid, ps.conf)
             ps.centroid = (cx, cy)
+            ps.last_ref_point = ref_point
 
-            self._handle_crossing(ps, cx, cy, now_unix, events)
+            self._handle_crossing(ps, ref_point, now_unix, events, geom)
 
-            inside = _in_polygon(cx, cy, self.config.roi)
+            inside = _in_polygon(ref_point[0], ref_point[1], geom["roi"]) if geom["roi"] else False
             ps.inside_roi = inside
             if inside and ps.entry_unix is None:
                 ps.entry_unix = now_unix
@@ -663,7 +987,7 @@ class QueueAnalytics:
                     "confidence": ps.conf,
                     "label": f"Joined queue (person #{tid})",
                 })
-            ps.prev_centroid = (cx, cy)
+            ps.prev_centroid = ref_point
 
         # ── metrics ──────────────────────────────────────────
         queue_members = [ps for ps in self.persons.values() if ps.inside_roi and ps.exit_unix is None]
@@ -736,6 +1060,8 @@ class QueueAnalytics:
                 "line_configured": self.config.line_configured,
                 "classifier_enabled": self.config.roi_configured,
                 "calibrated": self.config.calibrated,
+                "mapping_active": bool(self.config.mapping_active),
+                "reference_point": self._geometry_for_shape((w, h)).get("ref"),
             },
             "people_detected": len(tracks),
             "people_in_queue": occupancy,
@@ -783,44 +1109,159 @@ class QueueAnalytics:
                 del self.persons[tid]
         return events
 
-    def _handle_crossing(self, ps, cx, cy, now_unix, events):
-        if not self.config.line_configured or ps.prev_centroid is None:
-            return
-        a, b = self.config.counting_line[0], self.config.counting_line[1]
-        p1, p2 = ps.prev_centroid, (cx, cy)
-        if not _segment_crosses_line(p1, p2, a, b):
-            return
-        side = self.config.xray_side_point
-        s_new = _line_side(a, b, p2[0], p2[1])
-        s_side = _line_side(a, b, side[0], side[1])
-        direction = "EXIT" if (s_new >= 0) == (s_side >= 0) else "ENTER"
+    def _handle_crossing(self, ps, ref_point, now_unix, events, geom=None):
+        """Directional per-line crossing screening for one track.
 
-        if ps.entry_unix is None:
-            ps.entry_unix = now_unix
-            ps.entry_iso = iso_from_unix(now_unix)
-        ps.crossed_line = True
-        ps.exit_unix = now_unix
-        ps.exit_iso = iso_from_unix(now_unix)
-        ps.total_waiting_s = round(now_unix - ps.entry_unix, 3)
-        events.append({
-            "event_type": "line_crossing",
-            "direction": direction,
+        For each configured counting line the track keeps a committed
+        half-plane ``side``. A candidate crossing is a side change; it
+        only becomes an event once the track has stayed on the new side
+        for ``crossing_debounce_frames`` consecutive frames, which is
+        what suppresses jitter right next to the line and prevents a
+        track from generating duplicates. Reverse crossings (back out of
+        the side just committed) are always reported explicitly and never
+        increment the directional counters.
+
+        OUT events finalise waiting time and the exit timestamp; IN
+        events only register entry. Occupancy remains a live count of
+        ROI members and never derives from these counters.
+        """
+        if geom is None:
+            geom = self._geometry_for_shape(self._last_shape())
+        if not geom or not geom.get("lines"):
+            return
+        lines = geom["lines"]
+        if ps.prev_centroid is None:
+            # First observation of the track: establish the side, no event.
+            for ident, (a, b, _direction) in lines.items():
+                side = _side_int(a, b, ref_point)
+                st = ps.line_states.setdefault(ident, _TrackLineState())
+                if st.side == 0:
+                    st.side = side
+                    st.pending_side = side
+                    st.pending_frames = 0
+            return
+
+        p1, p2 = ps.prev_centroid, ref_point
+        debounce = max(0, int(self.config.crossing_debounce_frames))
+        any_event = False
+
+        for ident, (a, b, direction) in lines.items():
+            st = ps.line_states.setdefault(ident, _TrackLineState())
+            raw_side = _side_int(a, b, p2)
+            prev_raw = _side_int(a, b, p1)
+
+            # Initialise the committed side on the first usable frame.
+            if st.side == 0:
+                st.side = raw_side or prev_raw
+                st.pending_side = st.side
+                st.pending_frames = 0
+                continue
+
+            if raw_side == 0:
+                # Exactly on the line: never commits a side, never fires.
+                st.pending_side = st.side
+                st.pending_frames = 0
+                continue
+
+            if raw_side == st.side:
+                # Still on the committed side: the pending candidate, if
+                # any, is dead (it never survived the debounce window).
+                st.pending_side = st.side
+                st.pending_frames = 0
+                continue
+
+            # Candidate crossing: the track is on the far side.
+            if raw_side != st.pending_side:
+                st.pending_side = raw_side
+                st.pending_frames = 1
+            else:
+                st.pending_frames += 1
+            if st.pending_frames < debounce:
+                continue  # hold for `debounce` consecutive frames first
+
+            # Committed crossing.
+            st.side = raw_side
+            st.pending_side = raw_side
+            st.pending_frames = 0
+            st.last_event_unix = now_unix
+            st.last_direction = direction
+            event = self._emit_line_event(ps, ident, direction, raw_side, now_unix)
+            if event is not None:
+                events.append(event)
+                any_event = True
+
+        if any_event:
+            ps.crossed_line = True
+
+    def _emit_line_event(self, ps, ident, direction, raw_side, now_unix) -> Optional[dict]:
+        """Produce the wire event for a committed line crossing.
+
+        A crossing is *forward* when the track moves onto the side the
+        line's direction arrow points into and *reversed* when it moves
+        back out of it. Only OUT forward crossings finalise waiting time.
+
+        Wire contract: ``direction`` keeps the historical ``ENTER`` /
+        ``EXIT`` values (``app/snapshot.py`` and the HUD colour coding
+        depend on them); ``line_direction`` carries the mapping schema's
+        raw ``IN`` / ``OUT`` value.
+        """
+        st = ps.line_states[ident]
+        forward = raw_side > 0
+        event_type = "line_crossing" if forward else "line_crossing_reversed"
+        if not forward:
+            st.reverse_events += 1
+        wire_direction = "EXIT" if direction == "OUT" else "ENTER"
+
+        waiting_s = None
+        label = None
+        if forward:
+            if wire_direction == "EXIT":
+                ps.exit_unix = now_unix
+                ps.exit_iso = iso_from_unix(now_unix)
+                self.total_exits += 1
+                self.exit_timestamps.append(now_unix)
+                label = f"Cleared screening (person #{ps.track_id})"
+            else:
+                ps.entry_unix = now_unix
+                ps.entry_iso = iso_from_unix(now_unix)
+                self.total_entries += 1
+                self.entry_timestamps.append(now_unix)
+                label = f"Entered queue (person #{ps.track_id})"
+        # Waiting time is only meaningful once the track has an entry.
+        if ps.entry_unix is not None:
+            waiting_s = round(now_unix - ps.entry_unix, 3)
+        if forward and wire_direction == "EXIT":
+            ps.total_waiting_s = waiting_s
+
+        return {
+            "event_type": event_type,
+            "line_id": ident,
+            "direction": wire_direction,
+            "line_direction": direction,
+            "reversed": not forward,
             "track_id": ps.track_id,
             "event_time": iso_from_unix(now_unix),
-            "waiting_s": ps.total_waiting_s,
+            "waiting_s": waiting_s,
             "confidence": ps.conf,
-            "label": (
-                f"Cleared screening (person #{ps.track_id})"
-                if direction == "EXIT"
-                else f"Entered queue (person #{ps.track_id})"
+            "label": label or (
+                f"Reversed crossing ({wire_direction.lower()}) on {ident} (person #{ps.track_id})"
             ),
-        })
-        if direction == "EXIT":
-            self.total_exits += 1
-            self.exit_timestamps.append(now_unix)
-        else:
-            self.total_entries += 1
-            self.entry_timestamps.append(now_unix)
+        }
+
+    def _last_shape(self) -> Tuple[int, int]:
+        """Frame shape cached by the most recent ``update()`` call."""
+        return self._geom_cache_shape or (0, 0)
+
+    def reset_mapping(self) -> None:
+        """Drop cached geometry and per-track line state (config reload).
+
+        Called when a new mapping is applied at runtime so no stale
+        ROI/line cache or per-track side memory survives the swap.
+        """
+        self._geom_cache_shape = None
+        self._geom_cache = None
+        for ps in self.persons.values():
+            ps.line_states.clear()
 
     def _flow(self, now_unix) -> dict:
         windows = self.config.flow_windows_minutes or [1, 5]
@@ -890,6 +1331,8 @@ LINE_COLOR          = (0, 200, 255)     # amber
 # people instead of a rainbow, and no confidence scores.
 CCTV_ROI_FILL       = (46, 58, 18)      # faint amber wash
 CCTV_ROI_EDGE       = (0, 170, 210)     # thin amber boundary
+CCTV_CAPTION        = (0, 215, 255)     # brighter amber for captions, so the
+                                         # text stays readable on a light scene
 CCTV_LINE           = (0, 170, 210)     # thin amber counting line
 CCTV_TRACK          = (170, 190, 80)    # muted teal for tracked people
 CCTV_TRACK_OUTSIDE  = (140, 140, 140)   # people outside the queue area
@@ -972,12 +1415,42 @@ def _draw_layout(frame, config, display_scale=1.0):
     ``display_scale`` maps the native-pixel layout (ROI, counting line,
     X-ray side point) into the display frame, so the layout can be drawn
     directly on a downscaled copy of the capture.
+
+    Geometry source: the active mapping (native pixels) when one is
+    loaded, else the legacy ``config.roi`` / ``config.counting_line``.
+    Drawing and analytics always resolve through the same helper so a
+    technician calibrating a mapping sees exactly the geometry the
+    engine tests people with.
     """
     out = frame.copy()
     s = _ui_scale(out.shape[1])
+    frame_w, frame_h = int(out.shape[1]), int(out.shape[0])
 
-    if config.roi_configured:
-        roi = _scale_coords(config.roi, display_scale)
+    # ── resolve geometry (mapping -> legacy fallback) ────────
+    roi_pts = None
+    line_a = None
+    line_b = None
+    if config.mapping_active and _MAPPING_AVAILABLE:
+        try:
+            pix = mapping_to_pixel(config.mapping, (frame_w, frame_h))
+            roi_pts = pix.roi
+            if pix.out_line is not None:
+                line_a, line_b = pix.out_line[0], pix.out_line[1]
+            elif pix.in_line is not None:
+                line_a, line_b = pix.in_line[0], pix.in_line[1]
+        except MappingError:
+            roi_pts = None
+
+    if roi_pts is None:
+        if config.roi_configured:
+            roi_pts = tuple((float(x), float(y)) for x, y in config.roi)
+        if config.line_configured:
+            line_a = (float(config.counting_line[0][0]), float(config.counting_line[0][1]))
+            line_b = (float(config.counting_line[1][0]), float(config.counting_line[1][1]))
+
+    s_draw = float(display_scale)
+    if roi_pts:
+        roi = _scale_coords(roi_pts, s_draw)
         pts = np.array(roi, dtype=np.int32).reshape(-1, 1, 2)
         overlay = out.copy()
         cv2.fillPoly(overlay, [pts], CCTV_ROI_FILL)
@@ -987,17 +1460,16 @@ def _draw_layout(frame, config, display_scale=1.0):
         _dashed_polyline(out, pts, CCTV_ROI_EDGE, 1, 7 * s, 5 * s)
         _roi_badge(out, roi, s)
 
-    if config.line_configured:
-        line_pts = _scale_coords(config.counting_line, display_scale)
-        a = tuple(int(v) for v in line_pts[0])
-        b = tuple(int(v) for v in line_pts[1])
+    if line_a is not None and line_b is not None:
+        ax = (round(float(line_a[0]) * s_draw, 4), round(float(line_a[1]) * s_draw, 4))
+        bx = (round(float(line_b[0]) * s_draw, 4), round(float(line_b[1]) * s_draw, 4))
         # A single thin dashed line. The old overlay drew a black and a
         # white line under it plus two large badges, which read as a
         # vision demo rather than as a checkpoint.
-        _dashed_segment(out, a, b, CCTV_LINE, 1, 9 * s, 7 * s)
+        _dashed_segment(out, ax, bx, CCTV_LINE, 1, 9 * s, 7 * s)
         # Short end ticks mark the counting line without labelling it.
         tick = int(10 * s)
-        for (px, py), (qx, qy) in ((a, b), (b, a)):
+        for (px, py), (qx, qy) in ((ax, bx), (bx, ax)):
             dx, dy = qx - px, qy - py
             length = math.hypot(dx, dy) or 1.0
             nx, ny = -dy / length, dx / length
@@ -1074,7 +1546,7 @@ def _roi_badge(out, roi, s):
     """
     pts = np.array(roi, dtype=np.float32).reshape(-1, 2)
     top = pts[int(np.argmin(pts[:, 1]))]
-    _cctv_caption(out, "QUEUE AREA", (int(top[0]) + int(6 * s), int(top[1]) + int(16 * s)), 0.42 * s, CCTV_ROI_EDGE)
+    _cctv_caption(out, "QUEUE AREA", (int(top[0]) + int(6 * s), int(top[1]) + int(16 * s)), 0.42 * s, CCTV_CAPTION)
 
 
 def _box_label(out, text, org, scale, color, bg=(10, 10, 10)):
@@ -1260,11 +1732,26 @@ def _draw_video_layer(frame, tracks, config, track_confs=None, display_scale=1.0
     h, w = out.shape[:2]
     k = display_scale
 
+    # Resolve the geometry the track colouring tests against: the active
+    # mapping in native pixels, or the legacy ROI. Mirrors the analytics
+    # engine so a technician calibrating sees the same membership rules.
+    roi_pts = None
+    ref_mode = CENTROID_REFERENCE
+    if config.mapping_active and _MAPPING_AVAILABLE:
+        try:
+            pix = mapping_to_pixel(config.mapping, (int(frame.shape[1]), int(frame.shape[0])))
+            roi_pts = tuple(pix.roi)
+            ref_mode = pix.reference_point or CENTROID_REFERENCE
+        except MappingError:
+            roi_pts = None
+    if roi_pts is None and config.roi:
+        roi_pts = tuple((float(x), float(y)) for x, y in config.roi)
+
     for t in tracks:
         x1, y1, x2, y2 = int(t[0] * k), int(t[1] * k), int(t[2] * k), int(t[3] * k)
         tid = int(t[4])
-        ncx, ncy = (t[0] + t[2]) / 2.0, (t[1] + t[3]) / 2.0
-        inside = _in_polygon(ncx, ncy, config.roi)
+        ncx, ncy = reference_xy((t[0], t[1], t[2], t[3]), ref_mode)
+        inside = _in_polygon(ncx, ncy, roi_pts) if roi_pts else False
         color = CCTV_TRACK if inside else CCTV_TRACK_OUTSIDE
         # A thin outline, one muted colour. No corner brackets, no centroid
         # marker and no confidence score: the operator needs to know where

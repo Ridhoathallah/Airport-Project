@@ -157,9 +157,9 @@ dashboard:                       # ✅ IMPLEMENTED
 | `height` | int | `0` | No | Requested capture height (0 = native) |
 | `display_scale` | float | `1.0` | No | Window size relative to capture (0.5 = half) |
 | `detect_mode` | string | `"person"` | No | `"person"` or `"head"` |
-| `roi` | array\|null | `null` | **Yes** for analytics | Polygon `[[x,y],...]` in pixels |
-| `counting_line` | array\|null | `null` | **Yes** for flow | Two endpoints `[[x1,y1],[x2,y2]]` |
-| `xray_side_point` | array\|null | `null` | **Yes** for direction | Reference pixel `[x,y]` on X-ray side |
+| `roi` | array\|null | `null` | **Yes** for analytics | Polygon `[[x,y],...]` in pixels. **Ignored while a valid mapping exists in `config/mappings.yaml`** (kept as the legacy fallback for deployments without a mapping) |
+| `counting_line` | array\|null | `null` | **Yes** for flow | Two endpoints `[[x1,y1],[x2,y2]]`. Ignored while a mapping is active (legacy fallback) |
+| `xray_side_point` | array\|null | `null` | **Yes** for direction | Reference pixel `[x,y]` on X-ray side. Ignored while a mapping is active (legacy fallback) |
 | `queue_capacity` | int | `30` | No | Max expected people → occupancy % |
 | `flow_windows_minutes` | array | `[1,5]` | No | First = current, rest = rolling avg |
 | `track_lost_grace_seconds` | float | `1.5` | No | Track kept after loss |
@@ -237,6 +237,66 @@ AND sustained for persistence_seconds
 - `IDLE` — Queue empty
 - `STAGNANT` — People present, no crossings in window
 - `MOVING` — ≥ `min_events` crossings in `window_s`
+
+### Mapping Section
+
+Behaviour knob for the interactive camera mapping. The geometry itself lives
+in `config/mappings.yaml` (per camera), NOT here — `camera.yaml` only tunes
+how crossings are committed; editing geometry belongs to the dashboard's
+mapping editor or the file documented below.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `crossing_debounce_frames` | int | `2` | Consecutive frames a track must be observed on the far side of a counting line before the crossing is committed. `1` = legacy single-frame behaviour, `2` filters one-frame jitter. Deliberately separate from `classifier.debug`'s `debounce_frames` (the state-machine anti-flapping knob) |
+| `reference_point` | string | *(unset)* | **Optional compatibility override** of the mapping reference point (`"bottom_center"` = bbox bottom-edge midpoint — calibrated default stored in mappings.yaml; `"centroid"` = legacy behaviour). Leave unset to use the per-camera value from mappings.yaml |
+
+### Mappings file (`config/mappings.yaml`)
+
+Written and applied atomically by the mapping editor
+(`PUT /api/dashboard/mapping`) or by hand. Per camera, normalised
+coordinates (`x`, `y` ∈ `[0, 1]`, resolution-independent):
+
+```yaml
+schema_version: 1          # document version, repeated per camera entry
+
+cameras:
+  "CAMERA 01":
+    schema_version: 1
+    camera_id: "CAMERA 01"
+    roi:                    # queue polygon, 3..N vertices, simple (non-crossing)
+      - [0.125, 0.138889]
+      - [0.875, 0.138889]
+      - [0.875, 0.722222]
+      - [0.125, 0.722222]
+    lines:
+      in:                   # entering queue: forward crossing = INTO the
+        direction: "IN"     # half-plane RIGHT of p0→p1 (screen coords, y down)
+        points:
+          - [0.875, 0.777778]
+          - [0.125, 0.777778]
+      out:                  # exiting (towards X-ray): opposite orientation
+        direction: "OUT"
+        points:
+          - [0.125, 0.777778]
+          - [0.875, 0.777778]
+    reference_point: "bottom_center"   # "bottom_center" | "centroid"
+    created_at_iso: "2026-10-21T12:00:00+00:00"
+    updated_at_iso: "2026-10-21T12:57:00+00:00"
+```
+
+Rules enforced by `app/mapping.py.validate_mapping` (the API re-uses it):
+
+- coordinates in `[0, 1]`; ROI ≥ 3 vertices, non-zero area, no
+  self-intersections; IN/OUT lines not degenerate, not identical (same
+  geometry with opposite directions is legal but discouraged)
+- a line must span ≥ 1% of the frame diagonal to separate two sides
+  reliably across the whole frame
+- a valid mapping is the **single active geometry source**: while it
+  exists, `camera.yaml`'s legacy `roi` / `counting_line` /
+  `xray_side_point` are ignored (legacy fallback only when the file is
+  absent or invalid — never combined)
+- every save keeps the previous store as `mappings.yaml.bak`; a failed
+  validation or write leaves the last known-good mapping active
 
 ### Dashboard Section
 

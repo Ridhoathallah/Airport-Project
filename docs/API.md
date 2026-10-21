@@ -193,13 +193,21 @@ The FastAPI server provides real-time queue monitoring data for the React dashbo
 
 ### GET /api/camera/stream
 
-**Purpose:** MJPEG stream of annotated camera frames
+**Purpose:** MJPEG stream of camera frames
 
 **Response:** `multipart/x-mixed-replace; boundary=frame`
+
+**Query Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `annotated` | `1` | `1` streams the operator view with detections, ROI and counting line burned in. `0` streams the same raw camera picture without annotations (used by the mapping editor, which renders its own geometry). |
 
 **Usage:**
 ```html
 <img src="http://localhost:8080/api/camera/stream" alt="Live camera" />
+<!-- calibration editor: raw pixels, no burned-in geometry -->
+<img src="http://localhost:8080/api/camera/stream?annotated=0" alt="Calibration" />
 ```
 
 **Stream Format:**
@@ -286,6 +294,55 @@ additive to the `/api/*` endpoints above and return the
 **Response:** `camera_id`, `roi_configured`, `line_configured`, `roi_polygon`,
 `counting_line`, `xray_side`, `width`, `height`, `calibrated` (boolean) and
 `calibration` (`"METRES"` | `"PX ONLY"`).
+
+**Additive mapping fields (interactive calibration):** `source_shape_w`,
+`source_shape_h` (frame the geometry is calibrated against), `mapping_active`
+(true when the running analytics is driven by a validated mapping) and
+`reference_point` (`"bottom_center"` | `"centroid"`). Clients that do not know
+about them simply ignore them; nothing in the pre-mapping response changed.
+
+### GET /api/dashboard/mapping
+
+**Purpose:** The active per-camera mapping in normalised frame coordinates
+(`x`, `y` ∈ `[0, 1]`), ready for the mapping editor.
+
+**Response:** `camera_id`, `mapping_active`, `reference_point`,
+`mapping_source` (`"mappings.yaml"` | `"legacy"` | `"none"`), `source_shape_w/h`
+and `mapping` — the `MappingGeometry` document (`roi` polygon, `lines`
+(`in` / `out`, each two points and a direction), `reference_point`,
+`created_at_iso` / `updated_at_iso`). `mapping` is `null` when the camera is
+not calibrated at all. When no valid file entry exists but `camera.yaml` has
+legacy geometry, the in-memory derivation is returned with
+`mapping_source: "legacy"`. Note the never-combined rule: a valid mapping is
+the single active geometry source; legacy `roi` / `counting_line` /
+`xray_side_point` are only used as an in-memory fallback, never merged.
+
+### PUT /api/dashboard/mapping
+
+**Purpose:** Validate, apply and persist a per-camera mapping (interactive
+calibration). Camera-capable by design; the UI currently drives
+`CAMERA 01` only.
+
+**Request body:** `schema_version`, `roi` (polygon, normalised), `lines`
+(both shapes accepted: `{"in": {...}, "out": {...}}` keys or
+`[{id, points, direction}, ...]`), optional `reference_point` and
+`source_shape` (drawn-against frame, for pixel-scale checks).
+
+**Ordering guarantees (see `docs/ARCHITECTURE.md` § mapping):**
+
+1. Validation happens before anything is written. An invalid payload never
+   touches disk, so the running pipeline keeps its last known-good mapping —
+   the response then is `{"applied": false, "errors": [...]}` (HTTP 200).
+2. Persistence is atomic (`app/mapping.py.save_mapping`): serialise →
+   re-parse the rendered document → tempfile → `os.replace`, plus a
+   `mappings.yaml.bak` of the previous content.
+3. Only a successful write asks the detection loop to hot-reload
+   (`app/reload_signal.py`); the loop re-reads the config, swaps the mapping
+   and resets per-track crossing state. A failed update therefore leaves the
+   last known-good mapping active.
+
+**Response:** `applied`, `camera_id`, `errors`, `backup_path` (only when an
+existing store was replaced), `mapping_active`, `reference_point`.
 
 ### GET /api/dashboard/health
 

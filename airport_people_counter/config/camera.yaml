@@ -115,3 +115,25 @@ dashboard:
 # unlisted states use the built-in defaults.
 # recommendations:
 #   CONGESTED: "Congestion detected. Open secondary lanes immediately."
+# ── Mapping behaviour (geometry itself lives in config/mappings.yaml) ──
+#
+# `crossing_debounce_frames` is the per-track/per-line deduplication knob:
+# the number of consecutive frames a track must be observed on the far
+# side of a counting line before the crossing is committed (1 = legacy
+# single-frame behaviour, 2 = filters 1-frame jitter, default 2).
+# Deliberately separate from `classifier: debounce_frames`, which stays
+# the state-machine anti-flapping knob.
+#
+# `reference_point` is an OPTIONAL compatibility override of the mapping
+# reference point ("bottom_center" = bbox bottom edge midpoint, the
+# calibrated default in config/mappings.yaml; "centroid" = legacy).
+# Leave unset to use the value stored per camera in mappings.yaml.
+#
+# Do NOT add ROI / counting-line geometry here: while a valid mapping
+# exists for the camera in mappings.yaml it is the single active
+# geometry source and `roi` / `counting_line` / `xray_side_point` above
+# are ignored by the analytics engine (they remain as a legacy fallback
+# for deployments without a mapping).
+mapping:
+  crossing_debounce_frames: 2
+  # reference_point: bottom_center

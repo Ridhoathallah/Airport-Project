@@ -99,7 +99,7 @@ The system monitors people queuing at an airport X-ray security checkpoint:
 | **Person Detection** | YOLOv5s (COCO class 0) — 480px input, ~27ms inference on MPS |
 | **Multi-Object Tracking** | SORT algorithm — Kalman filter + Hungarian assignment + IoU |
 | **Queue ROI** | Configurable polygon defining the queue area |
-| **Line Counting** | ENTER/EXIT events when tracked people cross a virtual line |
+| **Line Counting** | ENTER/EXIT events on separate IN/OUT lines with debounce |
 | **Occupancy** | People in queue / capacity percentage |
 | **Flow Rate** | Entry and exit rates (1-min and 5-min rolling windows) |
 | **Waiting Time** | Per-person stopwatch from entry to exit |
@@ -146,6 +146,15 @@ cd airport_people_counter
 # Saves to config/camera.yaml
 ```
 
+**Interactive mapping & calibration (preferred):** everything above can be
+calibrated from the dashboard itself — open the page and press
+**"Edit mapping"** on the Live camera panel. Queue ROI and the IN/OUT lines
+are drawn on the raw camera feed and stored per camera (normalised, so a
+resolution change does not invalidate them) in
+`airport_people_counter/config/mappings.yaml`. The detector hot-reloads the
+geometry on the next frame; `camera.yaml` geometry remains as a legacy
+fallback for deployments without a mapping.
+
 ---
 
 ## CLI Reference
@@ -170,9 +179,17 @@ cd airport_people_counter
 
 ```bash
 ./start.sh                    # Start both backend + dashboard
-./start.sh -- --source 0      # Pass flags to backend
+./start.sh --source 1         # Use a different camera
+./start.sh --source clip.mp4  # Use a video file
+./start.sh --no-dashboard     # Backend only
 Ctrl+C                        # Graceful shutdown of both services
 ```
+
+The launcher checks the environment, starts the YOLO pipeline headless,
+waits for the API, starts the dashboard, waits for it, and prints a status
+block. It reuses an API or dashboard that is already running rather than
+starting a second copy, and it reports the camera as `NO SIGNAL` when
+frames are not arriving.
 
 ---
 
@@ -183,8 +200,9 @@ Ctrl+C                        # Graceful shutdown of both services
 | `/api/dashboard/snapshot` | GET | Full dashboard telemetry (queue, camera, KPIs, events, history, tracks) |
 | `/api/dashboard/health` | GET | Camera + pipeline health status |
 | `/api/dashboard/history` | GET | 240-sample trend data (4 minutes at 1 Hz) |
-| `/api/dashboard/config` | GET | Camera ROI + layout configuration |
-| `/api/camera/stream` | GET | MJPEG live video with tracking overlays |
+| `/api/dashboard/config` | GET | Camera ROI + layout configuration (+ additive mapping fields) |
+| `/api/dashboard/mapping` | GET/PUT | Per-camera queue ROI + IN/OUT lines (mapping editor) |
+| `/api/camera/stream` | GET | MJPEG live video with tracking overlays (`?annotated=0` = raw, for calibration) |
 | `/api/snapshot` | GET | Raw internal snapshot (legacy format) |
 | `/api/health` | GET | Raw health check (legacy format) |
 | `/api/shutdown` | POST | Gracefully shutdown the backend |

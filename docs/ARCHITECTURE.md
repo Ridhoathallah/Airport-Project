@@ -188,8 +188,12 @@ CAMERA / VIDEO FILE / IMAGE / RTSP STREAM
 | `FrameStream` | Camera capture + pacing | Source (index/path/URL) | Frames (BGR numpy) | Process frames |
 | `YOLOv5s` | Person detection | Frame | detections[N,5] | Track, classify |
 | `SortTracker` | Multi-object tracking | detections[N,5] | tracks[M,5] | Detect, classify |
-| `QueueAnalytics` | All queue metrics | tracks[], frame_shape, confs | Snapshot dict + events | Render, serve API |
+| `QueueAnalytics` | All queue metrics; resolves the active mapping geometry (mappings.yaml → legacy fallback) | tracks[], frame_shape, confs | Snapshot dict + events | Render, serve API |
 | `RuleClassifier` | State classification | occupancy, flow, spacing, wait | state + reasons[] | Persist state |
+| `queue_prototype._handle_crossing` | Per-track/per-line crossing engine: side commit, debounce, dedup, reversed crossings | ref point, line geometry | line events, counter updates | Double-count, lose jitter |
+| `mapping` (app/mapping.py) | Mapping schema, validation, normalised↔pixel conversion, atomic persistence | MappingGeometry / camera.yaml | errors / PixelGeometry / mappings.yaml | Classify, detect |
+| `reload_signal` (app/reload_signal.py) | Process-local "config changed" flag from the API thread | request_config_reload() | consume→reload | Persist anything |
+| `MappingEditor` (frontend) | Draw/correct ROI + IN/OUT lines over the raw stream | GET/PUT /api/dashboard/mapping | mapping payload | Enforce validation (backend does) |
 | `CongestionStopwatch` | Duration tracking | state transitions | duration_s + events | Classify |
 | `SnapshotBuilder` | Serialization | DashboardModel + tracks + events | QueueSnapshot (frozen) | Mutate inputs |
 | `SnapshotHolder` | Thread-safe sharing | QueueSnapshot + frame | Latest snapshot/frame | Process data |
@@ -270,6 +274,7 @@ Main Thread (detect_people.py)
 ├── SnapshotBuilder.build()
 ├── SnapshotHolder.update() ◄─── writer (holds lock briefly)
 ├── draw_dashboard() / draw_overlay()
+├── consume_config_reload() → hot-reload config + reset crossing state
 └── cv2.imshow() + cv2.waitKey(1)
 
 FastAPI Thread Pool (uvicorn workers)
@@ -277,31 +282,82 @@ FastAPI Thread Pool (uvicorn workers)
 ├── GET /api/health → SnapshotHolder.get_latest_snapshot()
 ├── GET /api/events → SnapshotHolder.get_latest_snapshot()
 ├── GET /api/config → loads camera.yaml (no holder)
-└── GET /api/camera/stream → SnapshotHolder.get_latest_frame() ◄─── reader
+├── GET/PUT /api/dashboard/mapping → load_camera_config + atomic persist
+├── GET /api/camera/stream → holder annotated OR raw frame (?annotated=0)
+└── PUT success → reload_signal.request_config_reload() ──► main thread picks it up on its next frame
 ```
+
+> Note: image sources (`*.jpg`) take a single-shot path that stops before
+> the frame loop — API streaming and hot reload are video/camera features.
 
 ## Configuration Flow
 
 ```
-config/camera.yaml (single source of truth)
-         │
+config/mappings.yaml (per-camera mapping — geometry source of truth
+                      while a valid entry exists)
+         │ validate + normalise (app/mapping.py)
          ▼
-load_camera_config() → CameraConfig dataclass
+load_camera_config() → CameraConfig(mapping=…, mapping_source=…)
          │
-         ├──► QueueAnalytics (thresholds, ROI, line, capacity)
+         ├── valid mapping found  → mapping drives analytics (single source)
+         ├── file absent/invalid  → legacy fallback derived in-memory from
+         │                          camera.yaml roi/counting_line/xray_side_point
+         └── neither              → geometry unconfigured
+         │
+         ├──► QueueAnalytics (mapping reference point + crossings + ROI)
+         ├──► SnapshotBuilder (config_status.mapping_active/reference_point)
+         ├──► draw_dashboard / draw_overlay (mapping geometry)
+         ├──► FastAPI /api/dashboard/{config,mapping} → JSON responses
+         └──► PUT /api/dashboard/mapping → validate → atomic save (.bak)
+                └──► reload_signal → detection loop re-reads + reset_mapping()
+
+config/camera.yaml (behaviour thresholds; geometry = legacy fallback)
+         │
+         ├──► QueueAnalytics (thresholds, capacity, crossing_debounce_frames)
          ├──► SnapshotBuilder (normalization, config_status)
          ├──► draw_dashboard / draw_overlay (layout, colors)
-         ├──► FastAPI /api/config → JSON response
          └──► --define-roi → writes back to camera.yaml
 ```
 
-## Four Queue Concepts (Kept Separate)
+## Camera Line Mapping & Calibration
+
+Resolution independence: mapping coordinates are normalised (`x`, `y` ∈
+`[0, 1]`) against the frame the geometry was drawn on, and converted to
+pixels of whatever the pipeline actually delivers
+(`mapping.to_pixel(mapping, (w, h))`) — recalibration survives a camera
+resolution change as long as the scene framing matches.
+
+Crossing engine (per track, per line — `PersonState.line_states`):
+
+1. Reference point: `bottom_center` of the bbox by default (see
+   `reference_point`), legacy `centroid` fallback.
+2. First sighting commits the side (sign of `_line_side`).
+3. A side change only *proposes* a crossing; it is committed after
+   `crossing_debounce_frames` consecutive frames on the far side
+   (default 2 ⇒ crossing frame + 1 stability frame). A shorter jitter
+   re-entry cancels it; standing still can never duplicate an event.
+4. A committed crossing is **forward** when the track moves onto the
+   half-plane the line's direction points into (`IN` = enter the queue,
+   `OUT` = exit towards X-ray), else `line_crossing_reversed` — explicit
+   and never counted, so walking back out cannot inflate throughput.
+5. Counters: forward IN registers entry only; forward OUT finalises
+   `exit_unix`/waiting time. Occupancy stays live ROI membership — it is
+   never entries-minus-exits, and only OUT crossings evict a track.
+
+Line-ordering contract for legacy geometry: the OUT line's positive
+half-plane (sign of `_line_side`) must contain the `xray_side_point`.
+Since the sign depends on endpoint order (a horizontal and a vertical
+counting line flip it), `from_legacy_camera_config` orients the
+derived IN/OUT lines by the sign at the X-ray point — it is never
+assumed from the point order.
+
+Four Queue Concepts (Kept Separate)
 
 | Concept | Definition | Computed By | Units |
 |---------|------------|-------------|-------|
-| **Occupancy** | People with centroid inside ROI | `QueueAnalytics` | count / % |
-| **Throughput / Flow** | People crossing EXIT line per time | `QueueAnalytics` | people/min |
-| **Waiting** | Entry → exit duration per track | `QueueAnalytics` | seconds |
+| **Occupancy** | People with reference point inside ROI (bottom_center/centroid) — live membership, never entries-minus-exits | `QueueAnalytics` | count / % |
+| **Throughput / Flow** | People crossing the OUT line (forward) per time | `QueueAnalytics` | people/min |
+| **Waiting** | Entry (ROI join or forward IN) → forward OUT exit duration per track | `QueueAnalytics` | seconds |
 | **Congestion** | Rule-based state from multiple variables | `RuleClassifier` | state enum |
 
 > **Critical:** These four concepts are computed independently. Congestion is NOT just "high occupancy" — it requires sustained occupancy + spacing confirmation + flow conditions.

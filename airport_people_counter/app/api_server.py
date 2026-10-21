@@ -34,6 +34,8 @@ from api_models import (
     Event as APIEvent,
 )
 from dashboard_models import (
+    MappingApplyResult,
+    MappingPayload,
     DashboardSnapshot,
     ConfigResponse,
     HealthResponse,
@@ -247,13 +249,21 @@ async def get_events(limit: int = Query(50, ge=1, le=200)):
     }
 
 
-async def _mjpeg_generator():
-    """Generate MJPEG stream from latest annotated frames."""
+async def _mjpeg_generator(annotated: bool = True):
+    """Generate MJPEG stream from frames in the snapshot holder.
+
+    ``annotated=True`` streams the operator view (YOLO boxes, ROI,
+    counting line); ``annotated=False`` streams the same raw camera
+    picture the mapping editor draws on, so calibration overlays are
+    rendered by the editor itself instead of being burned into the
+    pixels. Falls back to the annotated frame when no raw frame is
+    available (older pipeline processes).
+    """
     holder = get_holder()
     boundary = "frame"
 
     while True:
-        frame = holder.get_latest_frame()
+        frame = holder.get_latest_frame() if annotated else holder.get_latest_raw_frame()
         if frame is not None:
             _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             yield (
@@ -265,10 +275,16 @@ async def _mjpeg_generator():
 
 
 @app.get("/api/camera/stream")
-async def camera_stream():
-    """MJPEG stream of annotated camera frames."""
+async def camera_stream(annotated: int = Query(1, ge=0, le=1)):
+    """MJPEG stream of camera frames.
+
+    ``?annotated=1`` (default) burns in detections + geometry for the
+    monitoring view. ``?annotated=0`` serves the raw camera picture for
+    the mapping editor. Existing consumers are unaffected: the default
+    is identical to the pre-mapping behaviour.
+    """
     return StreamingResponse(
-        _mjpeg_generator(),
+        _mjpeg_generator(annotated=bool(annotated)),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
@@ -331,6 +347,123 @@ async def get_dashboard_config():
         calibrated=bool(config.calibrated),
         calibration="METRES" if config.calibrated else "PX ONLY",
         wait_alert_seconds=getattr(config, "backlog_min_wait_seconds", None),
+        # ── additive mapping fields (interactive calibration) ──
+        source_shape_w=getattr(config, "source_shape_w", None),
+        source_shape_h=getattr(config, "source_shape_h", None),
+        mapping_active=bool(getattr(config, "mapping_active", False)),
+        reference_point=_safe_reference_point(config),
+    )
+
+
+@app.get("/api/dashboard/mapping")
+async def get_dashboard_mapping():
+    """Get the active per-camera mapping in normalised coordinates.
+
+    Returns the mapping the analytics actually uses: the persisted
+    ``config/mappings.yaml`` entry when one is valid, otherwise the
+    mapping derived in-memory from the legacy ``camera.yaml`` geometry
+    (``mapping_source: "legacy"``). ``mapping`` is ``null`` when the
+    camera is not calibrated at all.
+    """
+    from queue_prototype import load_camera_config
+    from detect_people import DEFAULT_CAMERA_CONFIG_PATH
+    from mapping import MappingGeometry
+
+    config = load_camera_config(DEFAULT_CAMERA_CONFIG_PATH)
+    mapping = getattr(config, "mapping", None)
+    return {
+        "camera_id": config.camera_id,
+        "mapping_active": bool(getattr(config, "mapping_active", False)),
+        "reference_point": _safe_reference_point(config) or "centroid",
+        "mapping_source": getattr(config, "mapping_source", "none"),
+        "mapping": mapping.to_dict() if isinstance(mapping, MappingGeometry) else None,
+        "source_shape_w": getattr(config, "source_shape_w", None),
+        "source_shape_h": getattr(config, "source_shape_h", None),
+    }
+
+
+def _safe_reference_point(config) -> Optional[str]:
+    """The active reference point, tolerant of mock configs in tests."""
+    mapping = getattr(config, "mapping", None)
+    ref = getattr(mapping, "reference_point", None)
+    if isinstance(ref, str) and ref:
+        return ref
+    ref = getattr(config, "reference_point", None)
+    return ref if isinstance(ref, str) and ref else None
+
+
+@app.put("/api/dashboard/mapping", response_model=MappingApplyResult)
+async def put_dashboard_mapping(payload: MappingPayload):
+    """Validate, apply and persist a camera mapping.
+
+    Order guarantees:
+
+    1. Validation happens BEFORE anything is written — an invalid
+       payload never touches disk, so the running pipeline keeps its
+       last known-good mapping (no rollback dance needed at read time).
+    2. Persistence is atomic: serialise → re-parse → tempfile →
+       ``os.replace``, plus a ``mappings.yaml.bak`` of the previous
+       content.
+    3. Only a successful write asks the detection loop to hot-reload.
+    """
+    import os
+
+    from dashboard_models import MappingApplyResult, MappingPayload  # re-export convenience
+    from detect_people import DEFAULT_CAMERA_CONFIG_PATH
+    from mapping import (
+        MappingGeometry,
+        MappingError,
+        save_mapping,
+        default_mappings_path,
+        validate_mapping,
+    )
+    from reload_signal import request_config_reload
+
+    from queue_prototype import load_camera_config
+
+    config = load_camera_config(DEFAULT_CAMERA_CONFIG_PATH)
+    camera_id = config.camera_id or "CAMERA 01"
+
+    data = payload.model_dump()
+    data["camera_id"] = camera_id
+    # The frame shape for physical checks: prefer what the mapping was
+    # drawn against (client-provided), else the runtime's known shape.
+    if not data.get("source_shape") and config.source_shape_w and config.source_shape_h:
+        data["source_shape"] = {
+            "width": config.source_shape_w,
+            "height": config.source_shape_h,
+        }
+
+    try:
+        mapping = MappingGeometry.from_dict(data, camera_id=camera_id)
+    except MappingError as exc:
+        return MappingApplyResult(applied=False, camera_id=camera_id, errors=[str(exc)])
+
+    if data.get("source_shape"):
+        errors = validate_mapping(
+            mapping,
+            shape=(int(data["source_shape"]["width"]), int(data["source_shape"]["height"])),
+        )
+    else:
+        errors = validate_mapping(mapping)
+    if errors:
+        return MappingApplyResult(applied=False, camera_id=camera_id, errors=errors)
+
+    try:
+        backup_path = save_mapping(default_mappings_path(DEFAULT_CAMERA_CONFIG_PATH), mapping)
+    except (MappingError, OSError) as exc:
+        return MappingApplyResult(applied=False, camera_id=camera_id, errors=[f"persist failed: {exc}"])
+
+    # Success: the next detection-loop frame picks the new mapping up.
+    request_config_reload("api")
+    return MappingApplyResult(
+        applied=True,
+        camera_id=camera_id,
+        mapping=payload,
+        errors=[],
+        backup_path=str(backup_path) if backup_path else None,
+        mapping_active=True,
+        reference_point=mapping.reference_point,
     )
 
 

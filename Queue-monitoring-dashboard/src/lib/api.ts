@@ -113,6 +113,44 @@ export interface ConfigResponse {
   /** Wait duration in seconds the detector treats as long enough to contribute
    *  to a backlog condition. Used as the waiting time threshold marker. */
   wait_alert_seconds?: number;
+  /** Interactive mapping (config/mappings.yaml) — additive fields. */
+  source_shape_w?: number;
+  source_shape_h?: number;
+  mapping_active?: boolean;
+  reference_point?: string;
+}
+
+// ===== Interactive camera mapping (config/mappings.yaml) =====
+
+/** The active mapping exactly as the analytics resolves it. */
+export interface MappingResponse {
+  camera_id: string;
+  mapping_active: boolean;
+  reference_point: string;
+  /** "legacy" = derived from camera.yaml in memory; "mappings.yaml" = persisted. */
+  mapping_source: string;
+  mapping: {
+    schema_version: number;
+    camera_id: string;
+    roi: number[][];
+    lines: Array<{ id: string; points: number[][]; direction: "IN" | "OUT" }>;
+    reference_point: string;
+    source_shape: { width: number; height: number } | null;
+    created_at_iso?: string | null;
+    updated_at_iso?: string | null;
+  } | null;
+  source_shape_w?: number;
+  source_shape_h?: number;
+}
+
+export interface MappingApplyResult {
+  applied: boolean;
+  camera_id: string;
+  mapping: unknown;
+  errors: string[];
+  backup_path?: string | null;
+  mapping_active: boolean;
+  reference_point?: string | null;
 }
 
 export interface HealthResponse {
@@ -144,8 +182,36 @@ export async function getHealth(): Promise<HealthResponse> {
   return fetchJson<HealthResponse>("/health");
 }
 
-export function getVideoStreamUrl(): string {
-  return `${API_BASE}/camera/stream`;
+export function getVideoStreamUrl(annotated: boolean = true): string {
+  return annotated ? `${API_BASE}/camera/stream` : `${API_BASE}/camera/stream?annotated=0`;
+}
+
+// ===== Interactive camera mapping =====
+
+/** Convert the wire mapping (dict/list shapes, plain numbers) to MappingData. */
+export async function getMapping(): Promise<MappingResponse> {
+  return fetchJson<MappingResponse>("/dashboard/mapping");
+}
+
+export async function putMapping(payload: MappingPayload): Promise<MappingApplyResult> {
+  const res = await fetch(`${API_BASE}/dashboard/mapping`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    throw new Error(`API error ${res.status}: ${res.statusText}`);
+  }
+  return res.json();
+}
+
+/** Wire shape of `PUT /api/dashboard/mapping`. */
+export interface MappingPayload {
+  schema_version: number;
+  roi: number[][];
+  lines: Array<{ id: "in" | "out"; points: number[][]; direction: "IN" | "OUT" }>;
+  reference_point: "bottom_center" | "centroid";
+  source_shape?: { width: number; height: number };
 }
 
 export function isOnline(snapshot: SnapshotResponse | null): boolean {

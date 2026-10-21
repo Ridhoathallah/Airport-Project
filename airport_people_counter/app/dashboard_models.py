@@ -8,7 +8,7 @@ to snake_case JSON which the dashboard's convertApiSnapshot expects.
 
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict
 
@@ -152,6 +152,17 @@ class ConfigResponse(BaseModel):
     #: chart. Configured in config/camera.yaml, not invented here.
     wait_alert_seconds: Optional[float] = None
 
+    # ── Interactive mapping (config/mappings.yaml) — additive ──────
+    #: Native frame shape the per-camera geometry is calibrated against,
+    #: recorded by --define-roi / the mapping editor. ``None`` when the
+    #: runtime has not observed a frame yet.
+    source_shape_w: Optional[int] = None
+    source_shape_h: Optional[int] = None
+    #: True when the running analytics is driven by a validated mapping.
+    mapping_active: bool = False
+    #: The active mapping reference point ("bottom_center"/"centroid").
+    reference_point: Optional[str] = None
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -162,3 +173,53 @@ class HealthResponse(BaseModel):
     last_frame_age_ms: int
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ===== Interactive camera mapping (config/mappings.yaml) =====
+
+
+class MappingLinePayload(BaseModel):
+    """One virtual counting line in normalised frame coordinates."""
+
+    #: Exactly two ``[x, y]`` endpoints, each in ``[0, 1]``.
+    points: List[List[float]]
+    #: What a forward crossing of this line counts as.
+    direction: Literal["IN", "OUT"]
+
+
+class MappingPayload(BaseModel):
+    """A per-camera mapping in normalised frame coordinates.
+
+    Accepts exactly what the mapping editor draws: the queue ROI polygon
+    and the separate IN / OUT lines. ``camera_id`` comes from the path,
+    so the payload stays camera-agnostic and cannot cross-wire cameras.
+    ``lines`` accepts both shapes the schema validates: the dict form
+    ({"in": {...}, "out": {...}}) and the list form ([{id, ...}]).
+    """
+
+    schema_version: int = 1
+    camera_id: Optional[str] = None
+    roi: List[List[float]]
+    lines: Union[dict, List[dict]]  # validated in depth by mapping.from_dict
+    #: ``bottom_center`` (calibrated default) or ``centroid`` (legacy).
+    reference_point: Optional[Literal["bottom_center", "centroid"]] = None
+    #: Frame the coordinates were drawn against, for diagnostics.
+    source_shape: Optional[dict] = None
+
+
+class MappingApplyResult(BaseModel):
+    """Result of ``PUT /api/dashboard/mapping``.
+
+    ``applied`` is ``False`` when validation failed; ``errors`` then
+    carries one human-readable reason per problem and the running
+    pipeline keeps using its last known-good mapping.
+    """
+
+    applied: bool
+    camera_id: str
+    mapping: Optional[MappingPayload] = None
+    errors: List[str] = []
+    #: Where the previous file was backed up (``…mappings.yaml.bak``).
+    backup_path: Optional[str] = None
+    mapping_active: bool = False
+    reference_point: Optional[str] = None

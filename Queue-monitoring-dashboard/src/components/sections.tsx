@@ -9,11 +9,13 @@ import {
   TrendingDown,
   Minus,
   Users,
+  PencilLine,
 } from "lucide-react";
 import type { Snapshot, QueueEvent } from "../lib/telemetry";
 import { describeEvent } from "../lib/telemetry";
 import type { ConfigResponse } from "../lib/api";
 import { getVideoStreamUrl } from "../lib/api";
+import MappingEditor from "./MappingEditor";
 import {
   Panel,
   StatusMark,
@@ -75,7 +77,7 @@ export function QueueStatusPanel({ s }: { s: Snapshot }) {
         ? "var(--st-normal)"
         : "var(--text-secondary)";
   const TrendIcon = trend === "GROWING" ? TrendingUp : trend === "CLEARING" ? TrendingDown : Minus;
-  const trendLabel = trend === "GROWING" ? "Increasing" : trend === "CLEARING" ? "Clearing" : "Stable";
+  const trendLabel = trend === "GROWING" ? "Naik" : trend === "CLEARING" ? "Turun" : "Stabil";
 
   // The guidance line comes from the backend's recommendation table, so the
   // wording is configurable and never invented by the dashboard.
@@ -102,7 +104,9 @@ export function QueueStatusPanel({ s }: { s: Snapshot }) {
               <span className="t-state">{st.label}</span>
             </div>
             <p className="t-body mt-xs max-w-[40ch] text-text-secondary">{st.description}</p>
-            {active && s.reason && s.reason !== st.description && (
+            {/* The reason only adds something when the condition is not
+                normal; otherwise it repeats the sentence above. */}
+            {active && s.state !== "NORMAL" && s.reason && s.reason !== st.description && (
               <p className="t-body mt-xs max-w-[46ch] text-text-tertiary">{s.reason}</p>
             )}
             {showAction && (
@@ -461,14 +465,18 @@ export function CameraPanel({
   s,
   dataSource = "simulator",
   config = null,
+  onConfigChanged,
 }: {
   s: Snapshot;
   dataSource?: "simulator" | "api";
   config?: ConfigResponse | null;
+  /** Called after the mapping editor persists geometry, to refresh config. */
+  onConfigChanged?: () => void;
 }) {
   const [show, setShow] = useState({ boxes: true, ids: true, roi: true, line: true });
   const [streamError, setStreamError] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const [editing, setEditing] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const [panelSize, setPanelSize] = useState({ w: 0, h: 0 });
@@ -476,6 +484,8 @@ export function CameraPanel({
   const offline = !s.stateActive;
   const degraded = s.camera.link === "DEGRADED";
   const isApi = dataSource === "api";
+  // Calibration needs the real stream plus a config to diff against.
+  const canEdit = isApi && !offline && config !== null;
 
   useEffect(() => {
     const el = panelRef.current;
@@ -543,6 +553,17 @@ export function CameraPanel({
       icon={<Camera size={14} />}
       right={
         <div className="flex items-center gap-md">
+          {canEdit && (
+            <button
+              type="button"
+              className="ctl h-6 px-1.5 text-[11px]"
+              aria-pressed={editing}
+              title="Edit the queue area and IN/OUT counting lines on the live camera"
+              onClick={() => setEditing(true)}
+            >
+              <PencilLine size={13} /> Edit mapping
+            </button>
+          )}
           {!isApi && (
             <div className="flex items-center gap-xs">
               <OverlayToggle
@@ -710,7 +731,9 @@ export function CameraPanel({
           </div>
         )}
 
-        {streamError && !offline && (
+        {/* Only meaningful when a real stream is expected: the simulator
+            draws its own scene and has no stream to interrupt. */}
+        {streamError && !offline && isApi && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-sm bg-black/70">
             <StatusMark status={healthStyle("DEGRADED")} size={22} />
             <span className="t-title text-text-secondary">Camera stream interrupted</span>
@@ -718,6 +741,16 @@ export function CameraPanel({
               Reconnect
             </button>
           </div>
+        )}
+
+        {/* Interactive calibration overlays everything in this panel;
+            monitoring stays untouched while the editor is closed. */}
+        {editing && canEdit && (
+          <MappingEditor
+            config={config}
+            onSaved={onConfigChanged}
+            onExit={() => setEditing(false)}
+          />
         )}
       </div>
     </Panel>

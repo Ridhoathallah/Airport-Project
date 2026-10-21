@@ -188,6 +188,7 @@ class SnapshotBuilder:
     def _events_to_api(events: List[dict]) -> List[Event]:
         kind_map = {
             "line_crossing": "entry",
+            "line_crossing_reversed": "system",
             "track_enter_roi": "entry",
             "congestion_start": "congestion",
             "congestion_end": "congestion",

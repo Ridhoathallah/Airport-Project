@@ -65,15 +65,15 @@ export interface QueueEvent {
  * Congested and Backlog, and reports an incomplete setup as such.
  */
 const STATE_WORDS: Record<string, string> = {
-  EMPTY: "Kosong",
-  SPARSE: "Sepi",
+  EMPTY: "Empty",
+  SPARSE: "Quiet",
   NORMAL: "Normal",
-  BUSY: "Ramai",
-  CROWDED: "Ramai",
-  CONGESTED: "Padat",
-  BACKLOG: "Antrean Sangat Padat",
-  UNCONFIGURED: "Belum Diatur",
-  DATA_UNAVAILABLE: "Tidak ada data",
+  BUSY: "Busy",
+  CROWDED: "Busy",
+  CONGESTED: "Congested",
+  BACKLOG: "Backlog",
+  UNCONFIGURED: "Setup incomplete",
+  DATA_UNAVAILABLE: "No data",
 };
 
 /** Rewrite any internal state name inside a piece of operator-facing text. */
@@ -661,12 +661,15 @@ export function useRealTelemetry(pollInterval = POLL_INTERVAL_MS) {
 
 export function useCameraConfig() {
   const [config, setConfig] = useState<ConfigResponse | null>(null);
+  const [nonce, setNonce] = useState(0);
 
   useEffect(() => {
     getConfig()
       .then(setConfig)
       .catch(() => {});
-  }, []);
+  }, [nonce]);
 
-  return config;
+  /** Re-fetch after the mapping editor persists new geometry. */
+  const refresh = useCallback(() => setNonce((n) => n + 1), []);
+  return [config, refresh] as const;
 }

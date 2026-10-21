@@ -19,7 +19,9 @@ This document explicitly separates **CURRENT IMPLEMENTATION** from **FUTURE ROAD
 | SORT tracking (Kalman + IoU) | ✅ | `app/sort_tracker.py` |
 | Queue ROI polygon | ✅ | `config/camera.yaml roi` |
 | Interactive ROI definition | ✅ | `--define-roi` |
-| Counting line + direction | ✅ | `counting_line`, `xray_side_point` |
+| Interactive mapping editor | ✅ | Dashboard "Edit mapping" (`MappingEditor.tsx`), `GET/PUT /api/dashboard/mapping` |
+| `config/mappings.yaml` store | ✅ | Per-camera normalised geometry, atomic writes + `.bak` |
+| Counting line + direction | ✅ | `counting_line`, `xray_side_point` (legacy fallback while a mapping is active) |
 | ENTER/EXIT events | ✅ | Line crossing logic |
 | Occupancy % (people/capacity) | ✅ | `QueueAnalytics` |
 | Flow rates (1-min, 5-min) | ✅ | `flow_windows_minutes` |
@@ -40,7 +42,7 @@ This document explicitly separates **CURRENT IMPLEMENTATION** from **FUTURE ROAD
 | CameraPanel MJPEG + overlays | ✅ | `sections.tsx` |
 | Vite proxy `/api` → `:8080` | ✅ | `vite.config.ts` |
 | Evaluation tooling | ✅ | `scripts/evaluate_counts.py` |
-| Unit tests (137 passing) | ✅ | `make test` |
+| Unit tests (297 `make test` / 350 pytest) | ✅ | `make test` |
 
 ---
 
@@ -167,7 +169,7 @@ The following rules prevent scope creep and hallucinated requirements:
 
 ### Must Do After Changes
 
-- ✅ Run `make test` (137 tests)
+- ✅ Run `make test` (297 tests)
 - ✅ Run `make smoke` (offline validation)
 - ✅ Validate with real camera when camera behavior affected
 - ✅ Update documentation in same commit

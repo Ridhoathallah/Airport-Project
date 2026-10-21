@@ -236,3 +236,49 @@ All fixes verified with:
 - Backend: 169/169 unit tests passing (`make test`)
 - Frontend: TypeScript clean (`tsc --noEmit`), build succeeds
 - Integration: Dashboard shows live camera data, events, and charts with zero console errors
+
+---
+
+## Feature: Interactive Camera Line Mapping & Calibration
+
+**Date:** Mapping/calibration session
+**Files:** `app/queue_prototype.py`, `app/mapping.py` (new), `app/reload_signal.py` (new), `app/api_server.py`, `app/dashboard_models.py`, `app/detect_people.py`, `app/snapshot.py`, `config/mappings.yaml` (new), `config/camera.yaml`, `Queue-monitoring-dashboard/src/{lib/mapping.ts,components/MappingEditor.tsx,lib/api.ts,telemetry.ts,components/sections.tsx}`
+
+### Problem
+
+Geometry calibration (queue ROI, IN/OUT counting lines) required editing
+`config/camera.yaml` source comments in pixel coordinates — error-prone,
+camera/ops unreachable, and the legacy single counting line conflated the
+IN and OUT semantics of two different events.
+
+### Fix
+
+1. **`config/mappings.yaml`** — per-camera, per-frame-normalised geometry
+   (`roi` polygon + separate `in` / `out` lines) validated by
+   `app/mapping.py.validate_mapping` and persisted **atomically**
+   (serialise → re-parse → tempfile → `os.replace`) with automatic `.bak`
+   of the previous store. A valid mapping is the single active geometry
+   source; the legacy `camera.yaml` ROI/line is an in-memory fallback
+   only, never combined.
+2. **Crossing engine** — per-track/per-line state with a
+   `crossing_debounce_frames` hold (default 2) and dedup; forward direction
+   commits the counter change, the opposite direction emits an explicit
+   `line_crossing_reversed` event that changes nothing. Only a forward OUT
+   crossing finalises exit + waiting time; occupancy is live ROI membership
+   using the configurable reference point (`bottom_center` default).
+3. **API** — `GET`/`PUT /api/dashboard/mapping` (validate before write,
+   failed updates leave the last known-good mapping active) and the raw
+   `?annotated=0` stream for the editor. `GET /api/dashboard/config`
+   gained additive mapping fields.
+4. **Editor UI** — dashboard "Edit mapping" opens `MappingEditor.tsx`: draw
+   and drag ROI + line handles over the raw letterboxed feed, keyboard
+   nudging/swapping, validation feedback, revert, apply; a hot-reload
+   signal switches the running detector to the new mapping on the next
+   frame and resets per-track crossing state.
+
+### Verification
+
+- Backend: 349→350 pytest passing (mapping 25, mapping API 9, mapping-driven crossings 10 new)
+- Frontend: 30 Vitest tests passing (`pnpm test`), `tsc --noEmit` clean, `pnpm run build` green
+- Live end-to-end (video source + API + dashboard): editor drag & keyboard nudge → Save → `mappings.yaml` rewritten + `.bak` → `Config reloaded via api` in backend log; invalid PUT rejected with the disk untouched
+- Both MJPEG variants streaming (annotated vs `?annotated=0`)

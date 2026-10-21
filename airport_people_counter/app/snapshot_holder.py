@@ -19,12 +19,19 @@ class SnapshotHolder:
         self._lock = threading.Lock()
         self._snapshot: Optional[QueueSnapshot] = None
         self._frame: Optional[np.ndarray] = None
+        # Raw (un-annotated) camera frame, same display size as ``_frame``.
+        # Used by the mapping editor's raw-feed stream so calibration
+        # geometry is not burned into the picture an operator draws on.
+        self._raw_frame: Optional[np.ndarray] = None
 
-    def update(self, snapshot: QueueSnapshot, frame: Optional[np.ndarray] = None) -> None:
+    def update(self, snapshot: QueueSnapshot, frame: Optional[np.ndarray] = None,
+               raw_frame: Optional[np.ndarray] = None) -> None:
         with self._lock:
             self._snapshot = snapshot
             if frame is not None:
                 self._frame = frame.copy()
+            if raw_frame is not None:
+                self._raw_frame = raw_frame.copy()
 
     def get_latest_snapshot(self) -> Optional[QueueSnapshot]:
         with self._lock:
@@ -32,6 +39,15 @@ class SnapshotHolder:
 
     def get_latest_frame(self) -> Optional[np.ndarray]:
         with self._lock:
+            if self._frame is not None:
+                return self._frame.copy()
+            return None
+
+    def get_latest_raw_frame(self) -> Optional[np.ndarray]:
+        """The un-annotated camera frame (falls back to annotated)."""
+        with self._lock:
+            if self._raw_frame is not None:
+                return self._raw_frame.copy()
             if self._frame is not None:
                 return self._frame.copy()
             return None

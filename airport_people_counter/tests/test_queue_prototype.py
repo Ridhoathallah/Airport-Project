@@ -34,11 +34,33 @@ from queue_prototype import (
     recommendation_for,
     _scale_coords,
 )
+from mapping import LineMapping, MappingGeometry
 
 ROI = [[50, 50], [450, 50], [450, 350], [50, 350]]
 LINE = [[450, 50], [450, 350]]
 SIDE = (600, 200)  # X-ray side is to the right of the line
 SHAPE = (450, 800)  # (h, w)
+
+
+def make_mapping(reference_point="bottom_center"):
+    """A mapping for the interactive-calibration tests.
+
+    Frame 800 x 450. ROI band x in [200, 600] px, y in [180, 405] px.
+    Both counting lines are vertical, ordered bottom→top, so the
+    positive half-plane of each is to the RIGHT of the line: a forward
+    crossing is a rightward walk (IN at x=200, OUT at x=600 px).
+    """
+    return MappingGeometry(
+        camera_id="CAMERA 01",
+        roi=((0.25, 0.4), (0.75, 0.4), (0.75, 0.9), (0.25, 0.9)),
+        lines={
+            "in": LineMapping(points=((0.25, 0.9), (0.25, 0.1)), direction="IN"),
+            "out": LineMapping(points=((0.75, 0.9), (0.75, 0.1)), direction="OUT"),
+        },
+        reference_point=reference_point,
+        source_shape=(800, 450),
+    )
+
 
 
 def make_config(tmpdir, **overrides):
@@ -120,7 +142,11 @@ class TestLineCrossing(unittest.TestCase):
         cfg = make_config(tempfile.mkdtemp())
         a = QueueAnalytics(cfg)
         # person walks left->right across x=450 line (toward X-ray side)
-        for i, cx in enumerate([100, 300, 500]):
+        # 4 frames: one extra hold frame on the far side, because
+        # `crossing_debounce_frames` (default 2) requires the track to be
+        # observed on the new side for 2 consecutive frames before a
+        # crossing is committed. Same business assertion as before.
+        for i, cx in enumerate([100, 300, 500, 500]):
             snap = a.update(
                 [track(1, cx - 20, 150, cx + 20, 200)],
                 SHAPE, now_unix=1000.0 + i * 0.1,
@@ -134,9 +160,11 @@ class TestLineCrossing(unittest.TestCase):
         cfg = make_config(tempfile.mkdtemp())
         a = QueueAnalytics(cfg)
         # walk right->left across x=450 line (away from X-ray side)
-        # crossing happens between frame 1 (right) and frame 2 (left)
+        # crossing happens between frame 1 (right) and frame 2 (left);
+        # one extra hold frame for the default 2-frame crossing debounce.
         a.update([track(2, 480, 150, 520, 200)], SHAPE, now_unix=2000.0)
-        snap = a.update([track(2, 280, 150, 320, 200)], SHAPE, now_unix=2000.1)
+        a.update([track(2, 280, 150, 320, 200)], SHAPE, now_unix=2000.1)
+        snap = a.update([track(2, 280, 150, 320, 200)], SHAPE, now_unix=2000.2)
         crossings = [e for e in snap["events_since_last"] if e.get("event_type") == "line_crossing"]
         self.assertEqual(len(crossings), 1)
         self.assertEqual(crossings[-1]["direction"], "ENTER")
@@ -170,10 +198,17 @@ class TestWaitingTime(unittest.TestCase):
         for i in range(5):  # wait 5s inside
             a.update([track(1, 100, 150, 140, 200)], SHAPE, now_unix=now)
             now += 1
-        snap = a.update([track(1, 520, 150, 560, 200)], SHAPE, now_unix=now)  # exit
-        exits = [e for e in snap["events_since_last"] if e.get("event_type") == "line_crossing"]
-        self.assertEqual(exits[-1]["direction"], "EXIT")
-        self.assertGreaterEqual(exits[-1]["waiting_s"], 5.0)
+        # 3 exit-side frames so the default 2-frame crossing debounce commits;
+        # the event lands on the commit frame, so collect across the run.
+        crossing_events = []
+        for _ in range(3):
+            snap = a.update([track(1, 520, 150, 560, 200)], SHAPE, now_unix=now)  # exit
+            now += 1
+            crossing_events += [
+                e for e in snap["events_since_last"] if e.get("event_type") == "line_crossing"
+            ]
+        self.assertEqual(crossing_events[-1]["direction"], "EXIT")
+        self.assertGreaterEqual(crossing_events[-1]["waiting_s"], 5.0)
 
 
 class TestSpacing(unittest.TestCase):
@@ -486,12 +521,14 @@ class TestEntryExitTotals(unittest.TestCase):
         a = QueueAnalytics(cfg)
         # ENTER: right->left across x=450 (away from X-ray side)
         a.update([track(1, 480, 150, 520, 200)], SHAPE, now_unix=14000.0)
-        snap = a.update([track(1, 280, 150, 320, 200)], SHAPE, now_unix=14000.1)
+        a.update([track(1, 280, 150, 320, 200)], SHAPE, now_unix=14000.1)
+        snap = a.update([track(1, 280, 150, 320, 200)], SHAPE, now_unix=14000.2)
         self.assertEqual(snap["total_entries"], 1)
         self.assertEqual(snap["total_exits"], 0)
         # EXIT: left->right (toward X-ray side)
         snap = a.update([track(1, 280, 150, 320, 200)], SHAPE, now_unix=14000.2)
         snap = a.update([track(1, 480, 150, 520, 200)], SHAPE, now_unix=14000.3)
+        snap = a.update([track(1, 480, 150, 520, 200)], SHAPE, now_unix=14000.4)
         self.assertEqual(snap["total_entries"], 1)
         self.assertEqual(snap["total_exits"], 1)
 
@@ -499,9 +536,10 @@ class TestEntryExitTotals(unittest.TestCase):
         cfg = make_config(tempfile.mkdtemp())
         a = QueueAnalytics(cfg)
         a.update([track(1, 480, 150, 520, 200)], SHAPE, now_unix=15000.0)
-        snap = a.update([track(1, 280, 150, 320, 200)], SHAPE, now_unix=15000.1)
+        a.update([track(1, 280, 150, 320, 200)], SHAPE, now_unix=15000.1)
         # standing still after the crossing must not add a second entry
         snap = a.update([track(1, 280, 150, 320, 200)], SHAPE, now_unix=15000.2)
+        snap = a.update([track(1, 280, 150, 320, 200)], SHAPE, now_unix=15000.3)
         self.assertEqual(snap["total_entries"], 1)
         self.assertEqual(snap["total_exits"], 0)
 
@@ -511,7 +549,8 @@ class TestEntryFlowAndMovement(unittest.TestCase):
         cfg = make_config(tempfile.mkdtemp())
         a = QueueAnalytics(cfg)
         a.update([track(1, 480, 150, 520, 200)], SHAPE, now_unix=16000.0)
-        snap = a.update([track(1, 280, 150, 320, 200)], SHAPE, now_unix=16000.1)
+        a.update([track(1, 280, 150, 320, 200)], SHAPE, now_unix=16000.1)
+        snap = a.update([track(1, 280, 150, 320, 200)], SHAPE, now_unix=16000.2)
         self.assertEqual(snap["flow"]["entry_current_per_min"], 1)
         self.assertEqual(snap["flow"]["current_per_min"], 0)
 
@@ -525,7 +564,10 @@ class TestEntryFlowAndMovement(unittest.TestCase):
         self.assertEqual(snap["movement"], "STAGNANT")
         # a second person exits while the first stays -> MOVING (queue non-empty)
         a.update([track(1, 100, 150, 140, 200), track(2, 100, 150, 140, 200)], SHAPE, now_unix=17002.0)
-        snap = a.update([track(1, 100, 150, 140, 200), track(2, 480, 150, 520, 200)], SHAPE, now_unix=17003.0)
+        a.update([track(1, 100, 150, 140, 200), track(2, 480, 150, 520, 200)], SHAPE, now_unix=17003.0)
+        snap = a.update(
+            [track(1, 100, 150, 140, 200), track(2, 480, 150, 520, 200)], SHAPE, now_unix=17004.0
+        )
         self.assertEqual(snap["movement"], "MOVING")
 
 
@@ -679,6 +721,218 @@ class TestDashboardConfigRoundTrip(unittest.TestCase):
             self.assertEqual(loaded.dashboard_panel_width, 420)
             self.assertEqual(loaded.dashboard_chart_history, 200)
             self.assertEqual(loaded.recommendations.get(CONGESTED), "X")
+
+
+class TestMappingDrivenCrossings(unittest.TestCase):
+    """Mapping is the single active geometry source (replaces legacy)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        cfg = make_config(self.tmp)
+        cfg.mapping = make_mapping()  # valid mapping from mappings.yaml
+        cfg.reference_point = None  # mapping's own value decides
+        self.a = QueueAnalytics(cfg)
+
+    def _crossings(self, snap, *types):
+        return [
+            e for e in snap["events_since_last"]
+            if e.get("event_type") in types or (
+                types == ("all",) and e.get("event_type", "").startswith("line_")
+            )
+        ]
+
+    def test_in_crossing_registers_entry_and_keeps_occupancy(self):
+        """Regression: an IN crossing must NOT finalise the exit state.
+
+        The pre-mapping code set ``exit_unix``/``total_waiting_s`` on any
+        crossing, so an ENTER event evicted the person from the queue
+        filter (occ. filter uses ``exit_unix is None``) — occupancy
+        dropped although the passenger had just joined.
+        """
+        now = 8000.0
+        # left of the IN line (x=200 px), outside ROI
+        self.a.update([track(1, 100, 190, 140, 250)], SHAPE, now_unix=now)
+        now += 0.1
+        # crosses IN rightwards; one hold frame for the 2-frame debounce
+        snap = self.a.update([track(1, 240, 190, 280, 250)], SHAPE, now_unix=now)
+        now += 0.1
+        snap = self.a.update([track(1, 240, 190, 280, 250)], SHAPE, now_unix=now)
+        ins = [
+            e for e in snap["events_since_last"]
+            if e["event_type"] == "line_crossing"
+            and e.get("line_direction") == "IN" and not e.get("reversed")
+        ]
+        self.assertEqual(len(ins), 1)
+        self.assertEqual(snap["total_entries"], 1)
+        self.assertEqual(snap["total_exits"], 0)
+        ps = self.a.persons.get(1)
+        self.assertIsNotNone(ps)
+        self.assertIsNone(ps.exit_unix, "IN crossing must not finalise the exit")
+        self.assertIsNone(ps.total_waiting_s)
+        # occupancy = live ROI membership, NOT entries-minus-exits
+        self.assertEqual(snap["people_in_queue"], 1)
+        # more frames inside: occupancy must stay 1
+        now += 0.1
+        snap = self.a.update([track(1, 240, 190, 280, 250)], SHAPE, now_unix=now)
+        self.assertEqual(snap["people_in_queue"], 1)
+
+    def test_out_crossing_finalises_waiting_and_exit(self):
+        now = 8100.0
+        # enter through the IN line
+        self.a.update([track(1, 240, 190, 280, 250)], SHAPE, now_unix=now)
+        now += 0.1
+        self.a.update([track(1, 240, 190, 280, 250)], SHAPE, now_unix=now)
+        now += 1.5  # wait a moment inside
+        # walk right across the OUT line (x=600 px); commit needs a hold
+        snap = self.a.update([track(1, 620, 190, 660, 250)], SHAPE, now_unix=now)
+        now += 0.1
+        snap = self.a.update([track(1, 620, 190, 660, 250)], SHAPE, now_unix=now)
+        outs = [
+            e for e in snap["events_since_last"]
+            if e["event_type"] == "line_crossing"
+            and e.get("line_direction") == "OUT" and not e.get("reversed")
+        ]
+        self.assertEqual(len(outs), 1)
+        self.assertEqual(snap["total_exits"], 1)
+        self.assertEqual(snap["total_entries"], 0 if snap["people_in_queue"] else 0)
+        ps = self.a.persons.get(1)
+        self.assertIsNotNone(ps)
+        self.assertIsNotNone(ps.exit_unix)
+        self.assertIsNotNone(ps.total_waiting_s)
+        self.assertIn("waiting_s", outs[0])
+        # after leaving, occupancy drops to 0
+        now += 0.1
+        snap = self.a.update([track(1, 620, 190, 660, 250)], SHAPE, now_unix=now)
+        self.assertEqual(snap["people_in_queue"], 0)
+
+    def test_legacy_geometry_ignored_while_mapping_valid(self):
+        """A valid mapping must be the single geometry source.
+
+        The legacy camera.yaml geometry in ``make_config`` points at a
+        completely different area; crossing there must produce nothing.
+        """
+        now = 8200.0
+        # legacy line is x=450: walking 520→300 would cross it under the
+        # legacy code. The mapping's IN line is x=200, OUT at x=600.
+        self.a.update([track(1, 520, 190, 560, 250)], SHAPE, now_unix=now)
+        now += 0.1
+        snap = self.a.update([track(1, 300, 190, 340, 250)], SHAPE, now_unix=now)
+        now += 0.1
+        snap = self.a.update([track(1, 300, 190, 340, 250)], SHAPE, now_unix=now)
+        line_events = [
+            e for e in snap["events_since_last"] if e["event_type"].startswith("line_")
+        ]
+        self.assertEqual(line_events, [])
+
+    def test_roi_membership_uses_bottom_center_reference(self):
+        """bbox bottom inside the ROI ⇒ inside, even when centroid isn't.
+
+        ROI top edge is y=180 px. A box (300,140)-(340,200) has centroid
+        y=170 (outside under legacy centroid rules) but bottom-center
+        y=200 (inside under the mapping reference).
+        """
+        now = 8300.0
+        snap = self.a.update([track(5, 300, 140, 340, 200)], SHAPE, now_unix=now)
+        self.assertEqual(snap["people_in_queue"], 1)
+        self.assertTrue(self.a.persons[5].inside_roi)
+
+    def test_centroid_reference_fallback_reproduces_legacy_semantics(self):
+        cfg = make_config(self.tmp)
+        cfg.mapping = make_mapping(reference_point="centroid")
+        a = QueueAnalytics(cfg)
+        now = 8400.0
+        snap = a.update([track(5, 300, 140, 340, 200)], SHAPE, now_unix=now)
+        # centroid y=170 is above the ROI top edge (180) → not inside
+        self.assertEqual(snap["people_in_queue"], 0)
+        self.assertFalse(a.persons[5].inside_roi)
+
+    def test_occupancy_independent_of_entries_and_exits(self):
+        """Occupancy is the live ROI member count, never a difference."""
+        now = 8500.0
+        # two people inside, no crossings yet
+        self.a.update([track(1, 240, 190, 280, 250), track(2, 400, 190, 440, 250)], SHAPE, now_unix=now)
+        now += 0.1
+        snap = self.a.update(
+            [track(1, 240, 190, 280, 250), track(2, 400, 190, 440, 250)], SHAPE, now_unix=now
+        )
+        self.assertEqual(snap["people_in_queue"], 2)
+        # person 2 crosses OUT (two frames to commit)
+        now += 0.1
+        self.a.update([track(1, 240, 190, 280, 250), track(2, 620, 190, 660, 250)], SHAPE, now_unix=now)
+        now += 0.1
+        snap = self.a.update(
+            [track(1, 240, 190, 280, 250), track(2, 620, 190, 660, 250)], SHAPE, now_unix=now
+        )
+        # 1 person still inside — not entries(1 or 0) minus exits arithmetic
+        self.assertEqual(snap["people_in_queue"], 1)
+        self.assertEqual(snap["total_exits"], 1)
+
+    def test_jitter_at_line_produces_single_event(self):
+        """Debounce: a 1-frame flip to the far side must NOT count.
+
+        IN line at x=200; far side is x>200. Frames alternate across the
+        line but never hold 2 consecutive frames on the far side.
+        """
+        cfg = make_config(self.tmp)
+        cfg.mapping = make_mapping()
+        a = QueueAnalytics(cfg)
+        now = 8600.0
+        positions = [190, 210, 190, 210, 190, 210, 190]
+        total_events = 0
+        for cx in positions:
+            snap = a.update([track(7, cx - 20, 190, cx + 20, 250)], SHAPE, now_unix=now)
+            now += 0.1
+            total_events += len(
+                [e for e in snap["events_since_last"] if e["event_type"].startswith("line_")]
+            )
+        self.assertEqual(total_events, 0)
+
+    def test_crossing_commits_after_hold_frames(self):
+        cfg = make_config(self.tmp)
+        cfg.mapping = make_mapping()
+        a = QueueAnalytics(cfg)
+        now = 8700.0
+        events = []
+        for cx in [190, 210, 210]:  # hold 2 consecutive frames on far side
+            snap = a.update([track(7, cx - 20, 190, cx + 20, 250)], SHAPE, now_unix=now)
+            now += 0.1
+            events += [e for e in snap["events_since_last"] if e["event_type"].startswith("line_")]
+        self.assertEqual(len(events), 1)
+
+    def test_reverse_crossing_is_explicit_and_uncounted(self):
+        """Crossing back out of the positive side fires a reversed event
+        and never changes the directional counters."""
+        cfg = make_config(self.tmp)
+        cfg.mapping = make_mapping()
+        a = QueueAnalytics(cfg)
+        now = 8800.0
+        seq = [190, 210, 210, 190, 190]  # in, hold, back out, hold
+        seen = []
+        for cx in seq:
+            snap = a.update([track(9, cx - 20, 190, cx + 20, 250)], SHAPE, now_unix=now)
+            now += 0.1
+            seen += [e for e in snap["events_since_last"] if e["event_type"].startswith("line_")]
+        forward = [e for e in seen if not e.get("reversed")]
+        reversed_ = [e for e in seen if e.get("reversed")]
+        self.assertEqual(len(forward), 1)
+        self.assertGreaterEqual(len(reversed_), 1)
+        self.assertEqual(reversed_[0]["event_type"], "line_crossing_reversed")
+        self.assertEqual(reversed_[0]["direction"], "ENTER")
+        snap = a.update([], SHAPE, now_unix=now)
+        self.assertEqual(snap["total_entries"], 1, "reverse crossing must not add a second IN")
+
+    def test_mapping_override_survives_debounce_config(self):
+        """crossing_debounce_frames is honoured per configuration."""
+        cfg = make_config(self.tmp)
+        cfg.mapping = make_mapping()
+        cfg.crossing_debounce_frames = 1  # legacy single-frame behaviour
+        a = QueueAnalytics(cfg)
+        now = 8900.0
+        snap = a.update([track(3, 140, 190, 180, 250)], SHAPE, now_unix=now)
+        now += 0.1
+        snap = a.update([track(3, 190, 190, 230, 250)], SHAPE, now_unix=now)
+        events = [e for e in snap["events_since_last"] if e["event_type"].startswith("line_")]
+        self.assertEqual(len(events), 1)
 
 
 if __name__ == "__main__":

@@ -39,12 +39,14 @@ Ensure that future changes do not silently break queue counting accuracy. This d
 ## 1. Unit Tests (Automated)
 
 **Command:** `make test` or `venv/bin/python -m unittest discover -s tests`
-
-**Current:** 137 tests passing
+(297 tests at the time of the mapping feature; `venv/bin/python -m pytest
+tests/ -q` = 350 for the pytest target)
 
 | Test Module | Coverage |
 |-------------|----------|
-| `test_queue_prototype.py` | Camera-only analytics (occupancy, flow, waiting, spacing, classifier, stopwatch, events, ROI, calibration, dashboard rendering) |
+| `test_queue_prototype.py` | Camera-only analytics (occupancy, flow, waiting, spacing, classifier, stopwatch, events, ROI, calibration, dashboard rendering) + mapping-driven crossings: IN/OUT semantics, occupancy-is-membership regression (IN crossing must NOT finalise the exit), debounce/dedup/jitter, reversed crossings, bottom_center vs centroid reference, debounce knob |
+| `test_mapping.py` | Mapping schema: normalised↔pixel round trips, full validation matrix (bounds, vertex count, degenerate area, self-intersection, short lines, identical/degenerate lines, direction/reference/schema checks), legacy conversion for horizontal AND vertical counting lines (X-ray-side orientation), atomic save + backup + reload |
+| `test_mapping_api.py` | `GET/PUT /api/dashboard/mapping` against a temp config: legacy derivation reported, list AND dict line forms, backup created on update, invalid payload rejected with the last known-good file untouched, config endpoint additive fields |
 | `test_evaluate_counts.py` | Offline evaluator (alignment, MAE, ±1/±2 accuracy, bias, gaps) |
 | `test_backlog_alerts.py` | Legacy alert engine |
 | `test_fusion.py` | Legacy sensor fusion |
@@ -68,6 +70,8 @@ Ensure that future changes do not silently break queue counting accuracy. This d
 
 **Expected Output:**
 ```
+[INFO] mapping 'CAMERA 01' active from mappings.yaml — roi=4pt, lines=['in', 'out'], ref=bottom_center
+...
 PERSONS: 3   STATE: UNCONFIGURED   (image mode — no FPS)
 ```
 
@@ -75,7 +79,13 @@ PERSONS: 3   STATE: UNCONFIGURED   (image mode — no FPS)
 - YOLO model loads
 - Inference runs
 - Pipeline processes single frame
+- Camera mappings.yaml loads and validates (falls back to legacy
+  geometry with a `[WARN]` if the file is broken)
 - No crashes on image input
+
+**Note:** image sources stop after a single frame, so the API stream and
+the `PUT`-driven hot reload are only exercised by a video/camera source
+(see §5).
 
 ---
 
@@ -215,14 +225,49 @@ cd Queue-monitoring-dashboard && npm run dev
 ### MJPEG Stream Validation
 
 ```bash
-# Direct stream test
+# Direct stream test (annotated operator view)
 curl -N --max-time 5 http://localhost:8080/api/camera/stream | head -5
 # Should show MJPEG boundary + JPEG data
+
+# Raw variant (mapping editor view — same bytes without burned-in geometry)
+curl -N --max-time 5 "http://localhost:8080/api/camera/stream?annotated=0" | head -5
 
 # Browser test
 # <img src="http://localhost:8080/api/camera/stream" />
 # Should display live video with overlays
 ```
+
+---
+
+## 5b. Mapping & Calibration Validation
+
+Geometry is resolution-independent (normalised coordinates), so the desk AND
+the live-energy deployment validate the same assertions:
+
+1. **Geometry source rule** — with a valid `config/mappings.yaml` entry, the
+   backend logs `[INFO] mapping 'CAMERA 01' active from mappings.yaml — …`.
+   Delete/corrupt the file and it must fall back to legacy geometry with a
+   `[WARN]` (never a silent mix of the two).
+2. **Crossing semantics regression** — covered by
+   `tests/test_queue_prototype.py::TestMappingDrivenCrossings`: forward IN
+   registers an entry (occupancy stays ROI membership, exit state untouched),
+   forward OUT finalises exit + waiting time, reversed crossings are explicit
+   events that change no counter, jitter never fires, and
+   `crossing_debounce_frames` dedups multi-frame side changes.
+3. **Calibration round trip in the UI** (API + dashboard running):
+
+   | Step | Expected |
+   |------|----------|
+   | Open dashboard → "Edit mapping" | Editor over the raw (`?annotated=0`) feed, letterboxed so every handle is reachable, saved geometry ghosted |
+   | Drag a handle / nudge with arrow keys | `Unsaved changes` chip; Revert/Save/Apply enable |
+   | Save | `Mapping applied…`; `mappings.yaml` rewritten atomically + `.bak`; backend logs `Config reloaded via api` on the next frame; per-track crossing state reset |
+   | Send a deliberately invalid mapping (e.g. degenerate ROI) | `applied: false` with errors, disk untouched, running mapping still active |
+   | Close with Cancel | Stream returns to the annotated operator view, monitoring intact |
+
+4. **Reference point** — `bottom_center` (calibrated default) scores the
+   person at the bbox bottom-edge middle; switching `reference_point` to
+   `centroid` (`camera.yaml` override or mappings.yaml value) is a pure
+   analytics toggle verified by unit tests, no geometry change.
 
 ---
 

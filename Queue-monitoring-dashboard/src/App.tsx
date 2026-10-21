@@ -33,7 +33,7 @@ export default function App() {
 
   const simSnap = useTelemetry(scenario);
   const { snap: apiSnap, error: apiError, refetch } = useRealTelemetry();
-  const camConfig = useCameraConfig();
+  const [camConfig, refreshCamConfig] = useCameraConfig();
 
   const isLive = mode === "live";
   const s = isLive ? apiSnap : simSnap;
@@ -105,12 +105,15 @@ export default function App() {
           Left column: the condition and the camera. Right column: the flow,
           the trend and the waiting time. */}
       <main className="grid min-h-0 flex-1 grid-cols-1 gap-md overflow-y-auto p-md xl:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)] xl:overflow-hidden">
-        <div className="flex min-h-0 flex-col gap-md">
+        {/* The columns keep their content height below the two-column
+            breakpoint. `min-h-0` would let the grid rows collapse, and the
+            left column would overflow into the right one. */}
+        <div className="flex flex-col gap-md xl:min-h-0">
           <QueueStatusPanel s={s} />
-          <CameraPanel s={s} dataSource={dataSource} config={camConfig} />
+          <CameraPanel s={s} dataSource={dataSource} config={camConfig} onConfigChanged={refreshCamConfig} />
         </div>
 
-        <div className="flex min-h-0 flex-col gap-md">
+        <div className="flex flex-col gap-md xl:min-h-0">
           <MetricGrid s={s} />
           <AnalyticsPanel s={s} range={range} onRange={setRange} />
           <WaitingTimePanel s={s} range={range} config={camConfig} />

@@ -83,6 +83,7 @@ from queue_prototype import (
 )
 from snapshot import SnapshotBuilder
 from snapshot_holder import get_holder
+from reload_signal import consume_config_reload
 from shutdown import shutdown_requested
 
 # ─────────────────────────────────────────────────────────────
@@ -1075,7 +1076,9 @@ def run_detection(source=0, camera_config=None, monitor=None, detect_mode=None,
                 show_console_tip=False,
             )
             snap, _ = SnapshotBuilder.build(dash, system, camera_config, tracks, recent_events, stream_frame)
-            get_holder().update(snap, stream_frame)
+            # The raw display frame rides along so the mapping editor can
+            # stream the camera WITHOUT burned-in annotations (?annotated=0).
+            get_holder().update(snap, stream_frame, raw_frame=video_frame_disp)
 
             # Append to history buffer for dashboard trend charts
             from snapshot_buffer import get_history_buffer
@@ -1114,6 +1117,22 @@ def run_detection(source=0, camera_config=None, monitor=None, detect_mode=None,
             f"REASONS: {','.join(q.reasons)}",
             end="", flush=True,
         )
+
+        # Hot-reload requested by the API (e.g. PUT /api/dashboard/mapping).
+        # Same path as the 'r' key below; the per-track crossing state is
+        # reset so no stale side memory survives the geometry swap, and a
+        # failed update never reaches here because the endpoint only
+        # signals after a validated atomic persist.
+        reload_source = consume_config_reload()
+        if reload_source:
+            camera_config = load_camera_config(camera_config.path or DEFAULT_CAMERA_CONFIG_PATH)
+            analytics.config = camera_config
+            analytics.reset_mapping()
+            print(
+                f"\n[INFO] Config reloaded via {reload_source} — "
+                f"mapping active: {camera_config.mapping_active}, "
+                f"ref: {getattr(getattr(camera_config, 'mapping', None), 'reference_point', 'n/a')}"
+            )
 
         if not headless:
             key = cv2.waitKey(1) & 0xFF
