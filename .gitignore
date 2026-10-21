@@ -1,0 +1,95 @@
+# ============================================================
+# Airport-Project root .gitignore
+# Baseline classification (session: interactive camera mapping)
+# ============================================================
+
+# ── Operating system / editor artifacts ──────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# ── Virtual environments (library caches, never commit) ──────
+venv/
+.venv/
+env/
+
+# ── Node packages (dependency store, lockfiles ARE tracked) ──
+node_modules/
+
+# ── Python build / test caches ───────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ── Browser automation artifacts (tool-generated) ────────────
+.playwright-mcp/
+
+# ── Model weights: too large and replaceable by download ─────
+models/
+*.pt
+*.onnx
+*.pth
+
+# ── Datasets: image corpora never enter version control ──────
+# Manifests (datasets/manifests/) and datasets/README.md ARE
+# tracked — they are the versioned metadata, not the data.
+datasets/metadata/
+datasets/collected/
+datasets/reports/
+datasets/people_v1/
+datasets/*/images/
+datasets/*/labels/
+
+# ── Operational runtime output: recordings, logs, captures ───
+output/
+*.log
+*.jsonl.bak
+
+# ── Vendored upstream dependency with its own Git history ────
+# yolov5/ is an upstream clone of github.com/ultralytics/yolov5
+# carrying its own .git and pack files. Committing it would add
+# a nested embedded repository; it must be re-cloned instead.
+yolov5/
+
+# ── Nested, separately versioned system ──────────────────────
+# Queue-Monitoring-Sytem/ is its own Git repository (main) and
+# therefore cannot be committed here as normal content.
+Queue-Monitoring-Sytem/
+
+# ── Figma Make tool-managed install scripts ──────────────────
+.figma/
+
+# ── Generated build artifacts ────────────────────────────────
+dist/
+build/
+*.tsbuildinfo
+.vite/
+*.log
+
+# ── Root-level accidental artifacts ──────────────────────────
+package-lock.json
+*.zip
+
+# ── Generated session screenshots (prior verification runs) ──
+dashboard-test.png
+live-api-dashboard.png
+live-api-final.png
+
+# ── Secrets (defense in depth) ───────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Database files (except into the analytics pipeline) ──────
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3

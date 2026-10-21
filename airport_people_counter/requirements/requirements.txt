@@ -1,0 +1,30 @@
+# Airport People Counter — Milestone 1 Requirements
+# Install with:
+#   pip install -r requirements/requirements.txt
+
+# ── Core deep learning ───────────────────────────────────────
+# For macOS (CPU only):
+torch>=2.8.0
+torchvision>=0.23.0
+
+# ── YOLOv5 dependencies ──────────────────────────────────────
+matplotlib>=3.3
+numpy>=1.23.5
+opencv-python>=4.6.0
+Pillow>=10.3.0
+psutil
+PyYAML>=5.3.1
+requests>=2.32.2
+scipy>=1.4.1
+ultralytics-thop>=2.1.2
+ultralytics>=8.4.110
+pandas>=1.1.4
+seaborn>=0.11.0
+packaging
+setuptools>=70.0.0
+urllib3>=2.6.0
+
+# ── FastAPI for dashboard integration ────────────────────────
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.7

@@ -1,0 +1,443 @@
+"""
+FastAPI server for Queue Monitoring Dashboard integration.
+
+Endpoints:
+- GET /api/snapshot - Latest queue snapshot (1 Hz poll target)
+- GET /api/health - Camera/CV pipeline health
+- GET /api/config - Current camera configuration (read-only)
+- GET /api/events - Recent events
+- GET /api/camera/stream - MJPEG stream of annotated frames
+- GET /api/dashboard/snapshot - Dashboard-shaped snapshot (1 Hz poll target)
+- GET /api/dashboard/config - Dashboard configuration
+- GET /api/dashboard/health - Dashboard health
+- GET /api/dashboard/history - Dashboard history (240 samples)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from contextlib import asynccontextmanager
+from typing import Optional
+
+import cv2
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+from api_models import (
+    QueueSnapshot as APIQueueSnapshot,
+    HealthResponse as APIHealthResponse,
+    CameraState as APICameraState,
+    ConfigStatus as APIConfigStatus,
+    Track as APITrack,
+    Event as APIEvent,
+)
+from dashboard_models import (
+    DashboardSnapshot,
+    ConfigResponse,
+    HealthResponse,
+)
+from dashboard_adapter import build_dashboard_snapshot, reset_adapter_state
+from snapshot_buffer import downsample, get_history_buffer
+from snapshot_holder import get_holder
+from queue_prototype import CameraConfig
+from shutdown import request_shutdown, start_watchdog
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+
+
+app = FastAPI(
+    title="Airport X-Ray Queue Monitoring API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# Server start time for uptime calculation
+SERVER_START_TS = time.time()
+
+# CORS for Vite dev server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8443", "http://127.0.0.1:8443"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+
+def _convert_snap(snap) -> Optional[APIQueueSnapshot]:
+    """Convert internal QueueSnapshot to API QueueSnapshot."""
+    if snap is None:
+        return None
+    
+    # Convert tracks
+    api_tracks = [
+        APITrack(
+            id=t.id,
+            x=t.x,
+            y=t.y,
+            w=t.w,
+            h=t.h,
+            in_roi=t.in_roi,
+        )
+        for t in snap.tracks
+    ]
+    
+    # Convert events
+    api_events = [
+        APIEvent(
+            id=e.id,
+            t=e.t,
+            kind=e.kind,
+            severity=e.severity,
+            label=e.label,
+            detail=e.detail,
+        )
+        for e in snap.events
+    ]
+    
+    # Convert config status
+    api_config = APIConfigStatus(
+        roi_configured=snap.config_status.roi_configured,
+        line_configured=snap.config_status.line_configured,
+        calibrated=snap.config_status.calibrated,
+        classifier_enabled=snap.config_status.classifier_enabled,
+    )
+    
+    # Convert camera state
+    api_camera = APICameraState(
+        link=snap.camera_state.link,
+        fps=snap.camera_state.fps,
+        resolution=snap.camera_state.resolution,
+        frame_age_ms=snap.camera_state.frame_age_ms,
+    )
+    
+    return APIQueueSnapshot(
+        timestamp=snap.timestamp,
+        frame_id=snap.frame_id,
+        freshness=snap.freshness,
+        staleness_ms=snap.staleness_ms,
+        fps=snap.fps,
+        inference_ms=snap.inference_ms,
+        tracking_ms=snap.tracking_ms,
+        analytics_ms=snap.analytics_ms,
+        detection_count=snap.detection_count,
+        tracked_people=snap.tracked_people,
+        people_in_queue=snap.people_in_queue,
+        total_in=snap.total_in,
+        total_out=snap.total_out,
+        queue_state=snap.queue_state,
+        occupancy_percent=snap.occupancy_percent,
+        entry_rate=snap.entry_rate,
+        exit_rate=snap.exit_rate,
+        avg_wait_s=snap.avg_wait_s,
+        longest_wait_s=snap.longest_wait_s,
+        congestion_duration_s=snap.congestion_duration_s,
+        spacing_px=snap.spacing_px,
+        movement=snap.movement,
+        config_status=api_config,
+        calibration=snap.calibration,
+        camera_state=api_camera,
+        tracks=api_tracks,
+        events=api_events,
+    )
+
+
+@app.get("/api/snapshot", response_model=Optional[APIQueueSnapshot])
+async def get_snapshot():
+    """Get the latest queue snapshot for dashboard polling."""
+    holder = get_holder()
+    snap = holder.get_latest_snapshot()
+    return _convert_snap(snap)
+
+
+@app.get("/api/health", response_model=APIHealthResponse)
+async def get_health():
+    """Get camera and CV pipeline health status."""
+    holder = get_holder()
+    snap = holder.get_latest_snapshot()
+
+    if snap is None:
+        return APIHealthResponse(
+            camera=APICameraState(link="OFFLINE", fps=0.0, resolution="?", frame_age_ms=0),
+            cv={"detection": "STALLED", "tracking": "STALLED", "analytics": "STALLED"},
+            recording={"active": False},
+            data={"status": "NO_DATA"},
+        )
+
+    cv_status = "OK" if snap.fps > 0 else "STALLED"
+    api_snap = _convert_snap(snap)  # type: ignore[assignment]
+    return APIHealthResponse(
+        camera=api_snap.camera_state,
+        cv={
+            "detection": cv_status,
+            "tracking": cv_status,
+            "analytics": cv_status,
+            "inference_ms": snap.inference_ms,
+            "model": "YOLOv5s",
+            "tracker": "SORT",
+            "detections": snap.detection_count,
+            "active_tracks": snap.tracked_people,
+        },
+        recording={"active": False},
+        data={"status": snap.freshness, "staleness_ms": snap.staleness_ms},
+    )
+
+
+@app.get("/api/config")
+async def get_config():
+    """Get current camera configuration (read-only)."""
+    from queue_prototype import load_camera_config
+    from detect_people import DEFAULT_CAMERA_CONFIG_PATH
+    config = load_camera_config(DEFAULT_CAMERA_CONFIG_PATH)
+
+    return {
+        "camera_id": config.camera_id,
+        "width": config.width,
+        "height": config.height,
+        "roi_configured": config.roi_configured,
+        "line_configured": config.line_configured,
+        "xray_side": getattr(config, 'xray_side_point', None) and "right" or None,
+        "roi_polygon": config.roi if config.roi_configured else None,
+        "counting_line": config.counting_line if config.line_configured else None,
+        "classifier": {
+            "occupancy_sparse": config.occupancy_sparse,
+            "occupancy_normal": config.occupancy_normal,
+            "occupancy_crowded": config.occupancy_crowded,
+            "occupancy_congested": config.occupancy_congested,
+            "hysteresis": config.hysteresis,
+            "debounce_frames": config.debounce_frames,
+        },
+        "backlog": {
+            "min_people": config.backlog_min_people,
+            "min_occupancy": config.backlog_min_occupancy,
+            "min_wait_seconds": config.backlog_min_wait_seconds,
+            "persistence_seconds": config.backlog_persistence_seconds,
+        },
+    }
+
+
+@app.get("/api/events")
+async def get_events(limit: int = Query(50, ge=1, le=200)):
+    """Get recent events."""
+    holder = get_holder()
+    snap = holder.get_latest_snapshot()
+
+    if snap is None:
+        return {"events": []}
+
+    events = snap.events[:limit]
+    return {
+        "events": [
+            {
+                "id": e.id,
+                "t": e.t,
+                "kind": e.kind,
+                "severity": e.severity,
+                "label": e.label,
+                "detail": e.detail,
+                "technical": getattr(e, "technical", None),
+            }
+            for e in events
+        ]
+    }
+
+
+async def _mjpeg_generator():
+    """Generate MJPEG stream from latest annotated frames."""
+    holder = get_holder()
+    boundary = "frame"
+
+    while True:
+        frame = holder.get_latest_frame()
+        if frame is not None:
+            _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            yield (
+                f"--{boundary}\r\n"
+                f"Content-Type: image/jpeg\r\n"
+                f"Content-Length: {len(jpeg)}\r\n\r\n"
+            ).encode() + jpeg.tobytes() + b"\r\n"
+        await asyncio.sleep(1 / 30)
+
+
+@app.get("/api/camera/stream")
+async def camera_stream():
+    """MJPEG stream of annotated camera frames."""
+    return StreamingResponse(
+        _mjpeg_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+# ===== Dashboard API Endpoints =====
+
+@app.get("/api/dashboard/snapshot", response_model=DashboardSnapshot)
+async def get_dashboard_snapshot():
+    """Get the latest dashboard-shaped snapshot for dashboard polling (1 Hz)."""
+    holder = get_holder()
+    snap = holder.get_latest_snapshot()
+
+    if snap is None:
+        # Return a minimal snapshot with defaults
+        from queue_prototype import load_camera_config
+        from detect_people import DEFAULT_CAMERA_CONFIG_PATH
+        config = load_camera_config(DEFAULT_CAMERA_CONFIG_PATH)
+        history_buf = get_history_buffer()
+        return build_dashboard_snapshot(
+            snap=MockEmptySnapshot(),
+            config=config,
+            history=history_buf.snapshot(),
+            server_start_ts=SERVER_START_TS,
+        )
+
+    from queue_prototype import load_camera_config
+    from detect_people import DEFAULT_CAMERA_CONFIG_PATH
+    config = load_camera_config(DEFAULT_CAMERA_CONFIG_PATH)
+    history_buf = get_history_buffer()
+
+    return build_dashboard_snapshot(
+        snap=snap,
+        config=config,
+        history=history_buf.snapshot(),
+        server_start_ts=SERVER_START_TS,
+    )
+
+
+@app.get("/api/dashboard/config", response_model=ConfigResponse)
+async def get_dashboard_config():
+    """Get current camera configuration for dashboard."""
+    from queue_prototype import load_camera_config
+    from detect_people import DEFAULT_CAMERA_CONFIG_PATH
+    config = load_camera_config(DEFAULT_CAMERA_CONFIG_PATH)
+
+    # Determine xray_side
+    xray_side = None
+    if hasattr(config, 'xray_side_point') and config.xray_side_point is not None:
+        xray_side = "right" if config.xray_side_point[0] > config.width / 2 else "left"
+
+    return ConfigResponse(
+        camera_id=config.camera_id,
+        roi_configured=config.roi_configured,
+        line_configured=config.line_configured,
+        roi_polygon=config.roi if config.roi_configured else None,
+        counting_line=config.counting_line if config.line_configured else None,
+        xray_side=xray_side,
+        width=config.width,
+        height=config.height,
+        calibrated=bool(config.calibrated),
+        calibration="METRES" if config.calibrated else "PX ONLY",
+        wait_alert_seconds=getattr(config, "backlog_min_wait_seconds", None),
+    )
+
+
+@app.get("/api/dashboard/health", response_model=HealthResponse)
+async def get_dashboard_health():
+    """Get dashboard health status."""
+    holder = get_holder()
+    snap = holder.get_latest_snapshot()
+
+    if snap is None:
+        return HealthResponse(
+            status="NO_DATA",
+            camera=False,
+            api=True,
+            last_frame_age_ms=0,
+        )
+
+    camera_ok = snap.camera_state.link == "ONLINE"
+    last_frame_age_ms = snap.staleness_ms
+    status = "OK" if camera_ok else "DEGRADED"
+
+    return HealthResponse(
+        status=status,
+        camera=camera_ok,
+        api=True,
+        last_frame_age_ms=last_frame_age_ms,
+    )
+
+
+@app.get("/api/dashboard/history")
+async def get_dashboard_history(points: int = Query(240, ge=2, le=3600)):
+    """Get dashboard history.
+
+    The buffer holds one sample per second for the last hour. ``points``
+    selects how many evenly spaced samples to return, newest last.
+    """
+    history_buf = get_history_buffer()
+    samples = downsample(history_buf.snapshot(), max_points=points)
+    return {"samples": [s.model_dump() for s in samples]}
+
+
+#: The uvicorn server instance, when this module started it. Captured so
+#: the shutdown endpoint can ask uvicorn to stop serving gracefully.
+_server_ref = None
+
+
+def _shutdown_server():
+    """Request a graceful shutdown of the whole process.
+
+    The detection loop polls the shutdown flag and exits its loop, which
+    releases the camera and closes its outputs; uvicorn is asked to stop
+    accepting connections. A watchdog remains as a last resort so a
+    wedged process still terminates.
+    """
+    request_shutdown("api")
+    server = _server_ref
+    if server is not None:
+        server.should_exit = True
+    start_watchdog(timeout_s=10.0)
+
+
+@app.post("/api/shutdown")
+async def shutdown_server():
+    """Stop the backend: the detection loop exits, then the process ends."""
+    _shutdown_server()
+    return {"status": "shutting_down"}
+
+
+# Mock empty snapshot for when no data available
+class MockEmptySnapshot:
+    """Minimal snapshot-like object for empty state."""
+    people_in_queue = 0
+    queue_state = "DATA_UNAVAILABLE"
+    occupancy_percent = 0.0
+    congestion_duration_s = 0.0
+    entry_rate = 0.0
+    exit_rate = 0.0
+    avg_wait_s = 0.0
+    longest_wait_s = 0.0
+    fps = 0.0
+    inference_ms = 0.0
+    detection_count = 0
+    tracked_people = 0
+    timestamp = "2024-01-01T00:00:00Z"
+    tracks = []
+    events = []
+    staleness_ms = 0
+    camera_state = type('obj', (object,), {
+        'link': 'OFFLINE',
+        'fps': 0.0,
+        'resolution': '?',
+    })()
+
+
+def run_api_server(host: str = "0.0.0.0", port: int = 8080):
+    """Run the FastAPI server.
+
+    The uvicorn instance is kept so that ``POST /api/shutdown`` can ask it
+    to stop serving gracefully instead of killing the process.
+    """
+    import uvicorn
+
+    global _server_ref
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    server = uvicorn.Server(config)
+    _server_ref = server
+    try:
+        server.run()
+    finally:
+        _server_ref = None

@@ -1,0 +1,21 @@
+venv/
+__pycache__/
+*.pyc
+output/
+models/*.pt
+models/*.onnx
+.DS_Store
+
+# YOLOv5 training run artifacts (checkpoints, logs, plots).
+runs/
+
+# ML dataset tooling: the metadata catalog is derived state, and collected
+# review frames may contain identifiable people. Neither belongs in version
+# control. The manifests under datasets/manifests/ ARE tracked -- they are
+# the source of truth for a dataset version.
+*.db
+*.db-wal
+*.db-shm
+datasets/metadata/
+datasets/collected/
+datasets/reports/preview/

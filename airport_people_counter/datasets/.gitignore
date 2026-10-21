@@ -1,0 +1,9 @@
+# Generated dataset metadata and collected review material.
+#
+# The catalog is derived state (it indexes the manifests) and collected
+# frames may contain identifiable people -- neither belongs in version
+# control. The manifests under datasets/manifests/ ARE tracked, because
+# they are the source of truth for a dataset version.
+metadata/
+collected/
+reports/preview/

@@ -1,0 +1,314 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import '@figma/astraui/styles.css';
+@import 'tailwindcss';
+
+/*
+  Airport X-Ray Queue Monitoring System
+  ---------------------------------------------------------------------------
+  Reading this as: a fixed control-room monitoring console for airport security
+  operators, in a restrained aviation-operations visual language.
+  Dials: ENERGY 2 / RHYTHM 2 / MOTION 1.
+
+  Design decisions and why they are here:
+
+  - Fixed dark surface. The console runs 24/7 on a wall display in a dim
+    checkpoint office, so the surface is always dark rather than following the
+    OS theme.
+  - Navy-blue neutrals, not neutral grey. Airport wayfinding and AODB
+    conventions use a blue-grey operational palette; it also separates the
+    console from a generic "dark dashboard".
+  - One accent, blue #58A6FF, reserved for interactive affordances and the
+    primary data series. Everything else that carries colour is a *status*,
+    which is semantic and never decorative.
+  - Inter for anything the operator reads as language or a headline; JetBrains
+    Mono for anything that is a machine reading (clock, timestamps, camera
+    resolution, track ids) where digit alignment matters.
+  - Uppercase is reserved for field labels only. Values, event text and
+    headings are sentence case, because this is software people read all day.
+  - Tighter radii and a 4px spacing rhythm than the stock kit, so the console
+    reads as equipment rather than as a consumer app.
+*/
+
+:root,
+:root.dark {
+  /* ── Surfaces ────────────────────────────────────────────────────────────
+     Four steps only. Depth comes from surface steps, not from shadows. */
+  --brand-tertiary: #0b1220; /* page canvas */
+  --surface-bg: #121a2a; /* panel */
+  --bg-faint: #121a2a;
+  --bg-subtle: #1b2434; /* meter track, inset wells */
+  --bg-hover: #1f2b42;
+  --surface-hover: #1f2b42;
+  --surface-secondary-bg: #182236; /* raised tile */
+  --surface-dark: #182236;
+  --surface-dark-hover: #1f2b42;
+  --input-bg: #0e1622;
+
+  /* ── Borders ─────────────────────────────────────────────────────────────
+     --border-primary is the hairline between regions (decorative, low
+     contrast is intentional). --border-control is the visible outline of an
+     interactive element and clears 3:1 against the canvas. */
+  --border-primary: #24314a;
+  --border-secondary: #24314a;
+  --border-control: #5a6e92;
+  --border-selected: #58a6ff;
+
+  /* ── Text ────────────────────────────────────────────────────────────────
+     All three clear 4.5:1 on every surface used in the console. */
+  --text-primary: #f2f6fc;
+  --text-secondary: #a9b7cc;
+  --text-tertiary: #8494ab;
+
+  --modal-scrim: #050a12d9;
+
+  /* ── Status ──────────────────────────────────────────────────────────────
+     Semantic only. Every status is paired with a word and a glyph so colour
+     is never the sole carrier of meaning. */
+  --st-normal: #3fb950;
+  --st-busy: #d29922;
+  --st-congested: #f0883e;
+  --st-backlog: #f85149;
+  --st-offline: #7d8ca3;
+  --st-info: #58a6ff;
+
+  /* ── Data series ─────────────────────────────────────────────────────────
+     Entries / exits / queue length. */
+  --chart-entry: #58a6ff;
+  --chart-exit: #2dd4bf;
+  --chart-queue: #c7d3e4;
+  --chart-wait: #7dd3fc;
+
+  /* ── Type ──────────────────────────────────────────────────────────────── */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Menlo', monospace;
+
+  /* ── Rhythm ──────────────────────────────────────────────────────────────
+     A 4px grid. */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+  --space-2xl: 32px;
+
+  /* ── Radius ──────────────────────────────────────────────────────────────
+     Deliberately tighter than the kit default. */
+  --corner-sm: 3px;
+  --corner-md: 6px;
+  --corner-lg: 10px;
+  --corner-full: 999px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  background: var(--brand-tertiary);
+  color: var(--text-primary);
+  /* The console is a fixed instrument, not a document. */
+  overscroll-behavior: none;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Type scale
+   One class per level so hierarchy is enforced by the stylesheet rather
+   than by remembering an arbitrary size at each call site.
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* The queue count. The single largest element on the screen. */
+.t-display {
+  font-size: 56px;
+  font-weight: 600;
+  line-height: 0.94;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The queue state word. Second largest, and the only coloured headline. */
+.t-state {
+  font-size: 30px;
+  font-weight: 650;
+  line-height: 1.1;
+  letter-spacing: -0.015em;
+}
+
+/* A metric value inside a tile. */
+.t-metric {
+  font-size: 23px;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A panel title. */
+.t-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+}
+
+/* Body copy and event text. */
+.t-body {
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+/* A field label. The only place uppercase is allowed. */
+.t-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+/* Machine-read metadata: timestamps, resolutions, identifiers. */
+.t-meta {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 400;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tabular numerals for live values so digits do not jump on update. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Panels
+   Depth comes from the surface step, not from a border. Borders are for
+   interactive elements only.
+   ───────────────────────────────────────────────────────────────────────── */
+
+.panel {
+  background: var(--surface-bg);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--corner-md);
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  height: 38px;
+  padding-inline: var(--space-md);
+  border-bottom: 1px solid var(--border-primary);
+  flex-shrink: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Controls
+   ───────────────────────────────────────────────────────────────────────── */
+
+.ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding-inline: 10px;
+  border-radius: var(--corner-sm);
+  border: 1px solid var(--border-control);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background-color 140ms ease,
+    color 140ms ease,
+    border-color 140ms ease;
+}
+
+.ctl:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--text-tertiary);
+}
+
+.ctl:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.ctl[aria-pressed='true'],
+.ctl[data-active='true'] {
+  background: var(--bg-subtle);
+  border-color: var(--text-tertiary);
+  color: var(--text-primary);
+}
+
+/* Focus. Never removed, always visible, always the same shape. */
+:focus-visible {
+  outline: 2px solid var(--st-info);
+  outline-offset: 2px;
+  border-radius: var(--corner-sm);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Motion
+   Only value transitions and one live indicator. MOTION 1.
+   ───────────────────────────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Scrollbars
+   Visible on demand so a panel with content is discoverable.
+   ───────────────────────────────────────────────────────────────────────── */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-control) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-control);
+  border-radius: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* The live indicator on the camera feed. */
+@keyframes live-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.live-dot {
+  animation: live-dot 2s ease-in-out infinite;
+}
