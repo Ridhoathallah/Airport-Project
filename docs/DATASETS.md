@@ -5,10 +5,10 @@
 > the metadata catalog, training-experiment provenance and reproducible
 > evaluation.
 >
-> **Out of scope.** The runtime application (`app/`), the legacy monitoring
-> engine (`core/`), the FastAPI surface and the operational monitoring
-> database are owned by a separate engineering workstream. Nothing in this
-> document changes them, and nothing in `ml/` is imported by the runtime.
+> **Out of scope.** The runtime application (`app/`), the FastAPI surface and
+> the operational monitoring database are owned by a separate engineering
+> workstream. Nothing in this document changes them, and nothing in `ml/` is
+> imported by the runtime.
 > The dataset metadata catalog is a **different database** from the runtime
 > monitoring database: different file, different schema, different
 > lifecycle, no shared connection.
@@ -61,7 +61,8 @@ screenshot, and none of them is a photograph of a queue.
 
 Before this workstream: `make test` → **137 passed**; `pytest tests/` →
 **169 passed**. After: **202** and **234** respectively (the same 65 new
-tests are collected by both runners). See §10.
+tests are collected by both runners). See §10 — these are historical
+markers; run the suites for current totals (see [DEVELOPMENT.md](DEVELOPMENT.md)).
 
 ---
 
@@ -101,7 +102,7 @@ to keep in sync.
 
 ISO-8601 UTC with a trailing `Z` and millisecond precision
 (`2026-10-20T01:57:00.307Z`), matching the existing project convention
-(`core/models.py: utc_now_iso`, `app/queue_prototype.py: iso_from_unix`).
+(`app/queue_prototype.py: iso_from_unix`).
 Manifests store the string; the catalog stores the same string. The
 runtime monitoring database's epoch-seconds convention is a different
 schema and is not shared.

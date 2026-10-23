@@ -15,6 +15,7 @@
 #   ./start.sh --source 1      # a different camera
 #   ./start.sh --source clip.mp4
 #   ./start.sh --no-dashboard  # backend only
+#   ./start.sh --lan           # expose the dashboard on the LAN (default: localhost only)
 #
 # The browser never runs shell commands: it talks to the FastAPI service.
 # Starting the system is a local developer/operator action, so it belongs
@@ -33,6 +34,7 @@ HEALTH_URL="http://${API_HOST}:${API_PORT}/api/dashboard/health"
 
 SOURCE=""
 START_DASHBOARD=1
+DASH_HOST="127.0.0.1"
 PASSTHROUGH=()
 
 while [ $# -gt 0 ]; do
@@ -44,6 +46,7 @@ while [ $# -gt 0 ]; do
     --dash-port)   DASH_PORT="${2:-}"; shift 2 ;;
     --dash-port=*) DASH_PORT="${1#*=}"; shift ;;
     --no-dashboard) START_DASHBOARD=0; shift ;;
+    --lan)         DASH_HOST="0.0.0.0"; shift ;;
     -h|--help)
       sed -n '3,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -55,6 +58,23 @@ BACKEND_PID=""
 FRONTEND_PID=""
 LOG_DIR="${ROOT_DIR}/.run"
 mkdir -p "${LOG_DIR}"
+
+# Bound the logs. The pipeline writes a status line every second; a long
+# run would otherwise grow the file without limit. Anything past the cap
+# is rotated to a single .1 file, so the directory never exceeds 2x the cap.
+LOG_MAX_BYTES=$((8 * 1024 * 1024))
+rotate_log() {
+  local file="$1"
+  [ -f "${file}" ] || return 0
+  local size
+  size=$(wc -c < "${file}" 2>/dev/null || echo 0)
+  if [ "${size}" -gt "${LOG_MAX_BYTES}" ]; then
+    mv -f "${file}" "${file}.1"
+    : > "${file}"
+  fi
+}
+rotate_log "${LOG_DIR}/backend.log"
+rotate_log "${LOG_DIR}/frontend.log"
 
 CLEANED=0
 cleanup() {
@@ -178,7 +198,7 @@ if [ "${START_DASHBOARD}" = "1" ]; then
     # Run vite directly: going through "npm run dev" would leave the real
     # vite process as a grandchild, and signalling the npm wrapper would
     # orphan it.
-    ( cd "${FRONTEND_DIR}" && exec "${VITE_BIN}" --port "${DASH_PORT}" ) \
+    ( cd "${FRONTEND_DIR}" && exec "${VITE_BIN}" --port "${DASH_PORT}" --host "${DASH_HOST}" ) \
       >"${LOG_DIR}/frontend.log" 2>&1 &
     FRONTEND_PID=$!
 

@@ -265,24 +265,29 @@ export function MetricTile({
   value,
   unit,
   trend,
-  accent,
+  tone,
   footnote,
 }: {
   label: string;
   value: string;
   unit?: string;
   trend?: ReactNode;
-  accent?: string;
+  /** Colour for the value, when the value itself carries meaning. */
+  tone?: string;
   footnote?: string;
 }) {
   return (
-    <div className="flex min-w-0 flex-col justify-between gap-xs rounded-corner-md border border-border-primary bg-surface-secondary-bg px-md py-sm">
-      <div className="flex items-center justify-between gap-xs">
-        <span className="t-label text-text-tertiary">{label}</span>
-        {accent && <span className="h-1.5 w-1.5 rounded-full" style={{ background: accent }} aria-hidden />}
-      </div>
+    /*
+      No card. The panel is already the surface, and a border here would
+      put a frame around a number that needs no frame. The metrics of one
+      group read as one table, separated by space.
+    */
+    <div className="flex min-w-0 flex-col justify-between gap-xs">
+      <span className="t-label text-text-tertiary">{label}</span>
       <div className="flex items-baseline gap-1">
-        <span className="t-metric text-text-primary">{value}</span>
+        <span className="t-metric" style={{ color: tone || "var(--text-primary)" }}>
+          {value}
+        </span>
         {unit && <span className="text-[11px] text-text-tertiary">{unit}</span>}
       </div>
       <div className="flex min-h-[18px] items-end justify-between gap-xs">

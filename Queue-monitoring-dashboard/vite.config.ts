@@ -36,7 +36,10 @@ export default defineConfig(({ mode }) => {
       watch: { ignored: ['**/.figma/**'] },
       proxy: {
         '/api': {
-          target: 'http://localhost:8080',
+          // The backend address can be pointed elsewhere with
+          // API_PROXY_TARGET, which is what a second instance (or a test
+          // against a different pipeline) needs.
+          target: process.env.API_PROXY_TARGET || 'http://localhost:8080',
           changeOrigin: true,
           rewrite: (path) => path,
         },

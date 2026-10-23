@@ -1,0 +1,140 @@
+# Airport X-Ray Screening Queue — Camera-Only Prototype configuration.
+#
+# This configures the camera analytics layer (app/queue_prototype.py).
+# Everything here is camera-relative — no real-world (metre) value is
+# assumed. Thresholds are EXAMPLE values to be calibrated against real
+# CCTV footage later. Do not treat them as certified or deployment-grade.
+
+camera:
+  # Operator-facing camera label shown in the dashboard header.
+  rotation: 0
+  camera_id: CAMERA 01
+
+  # Camera source: webcam index ("0", "1", ...), video file path,
+  # image path, or RTSP/HTTP URL.  CLI --source overrides this value.
+  source: '0'
+
+  # Capture resolution requested from the camera. 0 = use the camera's
+  # native resolution (recommended: keeps the source sharp). If the camera
+  # does not support the requested size, it falls back to the nearest
+  # supported resolution and the actual size is logged.
+  width: 1280
+  height: 720
+
+  # Display scale relative to the captured frame width (1.0 = full native,
+  # 0.5 = half width). 0 = full native.
+  display_scale: 1.0
+
+  # Detection target: "person" (full body, default) or "head" (head-only
+  # crop mode, for high/steep camera perspectives where bodies are hidden).
+  detect_mode: person
+
+  # Queue ROI polygon, pixel coordinates [[x, y], ...].
+  # Calibrated for laptop camera 1280x720 demo scene.
+  roi:
+    - [160.0, 100.0]
+    - [1120.0, 100.0]
+    - [1120.0, 520.0]
+    - [160.0, 520.0]
+
+  # Virtual counting line, two endpoints [[x1, y1], [x2, y2]].
+  counting_line:
+    - [160.0, 560.0]
+    - [1120.0, 560.0]
+
+  # A reference pixel on the X-RAY side of the counting line.
+  #   Crossing toward this point = EXIT  (processed / throughput)
+  #   Crossing away from it      = ENTER (joining the queue)
+  xray_side_point: [640.0, 650.0]
+
+  # Expected maximum people in the ROI -> normalized occupancy %.
+  queue_capacity: 30
+
+  # Flow windows in minutes. The first entry is the "current" window;
+  # the rest are rolling averages reported as people/min.
+  flow_windows_minutes: [1, 5]
+
+  # How long a vanished track is kept as "in queue" before it is dropped.
+  track_lost_grace_seconds: 1.5
+
+classifier:
+  # Occupancy-ratio ladder for EMPTY / SPARSE / NORMAL / CROWDED / CONGESTED.
+  occupancy_sparse: 0.10
+  occupancy_normal: 0.40
+  occupancy_crowded: 0.60
+  occupancy_congested: 0.80
+
+  # Slack before the classifier downgrades (anti-flapping).
+  hysteresis: 0.05
+  # Consecutive frames with the same candidate before the state commits.
+  debounce_frames: 5
+
+  # CONGESTED requires mean pixel spacing to be at/below this value.
+  congested_max_spacing_px: 60
+  congested_require_spacing: true
+
+backlog:
+  min_people: 15
+  min_occupancy: 0.60
+  min_wait_seconds: 300
+  persistence_seconds: 10.0
+  flow_ratio_below_baseline: 0.5
+  flow:
+    # Expected normal throughput (people/min), measured from REAL footage.
+    # null -> BACKLOG classification is disabled and the snapshot reports:
+    #   "BACKLOG CHECK UNAVAILABLE — FLOW BASELINE NOT CONFIGURED"
+    baseline_people_per_minute: null
+
+calibration:
+  # Fill in only when a camera calibration / homography is available.
+  # Until then all measurements stay pixel-relative (uncalibrated).
+  homography_path: null
+  px_per_metre: null
+
+source:
+  # Recorded by --define-roi so a saved layout can be re-validated later.
+  shape_w: 1280
+  shape_h: 720
+
+# Queue-movement classification for the dashboard: the queue counts as
+# MOVING when at least `min_events` line crossings happen inside `window_s`;
+# a non-empty queue with no crossings is STAGNANT; an empty queue is IDLE.
+movement:
+  window_s: 60
+  min_events: 1
+
+dashboard:
+  # Rolling average window (seconds) for the smoothed in-queue-people value
+  # shown in the trend charts. Display only — never feeds the classifier.
+  occupancy_avg_window_s: 120
+  # Width (px at UI scale 1.0) of the right-hand status panel.
+  panel_width: 360
+  # Number of samples kept per live trend chart.
+  chart_history: 120
+
+# Per-state operational recommendations. Override any/all states here;
+# unlisted states use the built-in defaults.
+# recommendations:
+#   CONGESTED: "Congestion detected. Open secondary lanes immediately."
+# ── Mapping behaviour (geometry itself lives in config/mappings.yaml) ──
+#
+# `crossing_debounce_frames` is the per-track/per-line deduplication knob:
+# the number of consecutive frames a track must be observed on the far
+# side of a counting line before the crossing is committed (1 = legacy
+# single-frame behaviour, 2 = filters 1-frame jitter, default 2).
+# Deliberately separate from `classifier: debounce_frames`, which stays
+# the state-machine anti-flapping knob.
+#
+# `reference_point` is an OPTIONAL compatibility override of the mapping
+# reference point ("bottom_center" = bbox bottom edge midpoint, the
+# calibrated default in config/mappings.yaml; "centroid" = legacy).
+# Leave unset to use the value stored per camera in mappings.yaml.
+#
+# Do NOT add ROI / counting-line geometry here: while a valid mapping
+# exists for the camera in mappings.yaml it is the single active
+# geometry source and `roi` / `counting_line` / `xray_side_point` above
+# are ignored by the analytics engine (they remain as a legacy fallback
+# for deployments without a mapping).
+mapping:
+  crossing_debounce_frames: 2
+  # reference_point: bottom_center

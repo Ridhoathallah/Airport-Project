@@ -36,6 +36,8 @@ import cv2
 import numpy as np
 import yaml
 
+from orientation import VALID_ROTATIONS
+
 try:  # Mapping schema lives next to this module when running inputs.
     from mapping import (  # type: ignore
         BOTTOM_CENTER_REFERENCE,
@@ -198,6 +200,19 @@ def _segment_crosses_line(p1, p2, a, b) -> bool:
 # ---------------------------------------------------------------------
 
 
+def _parse_rotation(raw) -> int:
+    """Coerce camera.rotation to a valid 0/90/180/270 (defaults to 0)."""
+    try:
+        value = int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        value = -1
+    if value not in VALID_ROTATIONS:
+        if raw is not None:
+            print(f"[WARN] camera.rotation {raw!r} invalid — using 0")
+        value = 0
+    return value
+
+
 @dataclass
 class CameraConfig:
     """Camera-relative layout + classifier thresholds."""
@@ -261,6 +276,12 @@ class CameraConfig:
     # image path, or RTSP/HTTP URL.  None → CLI/default behavior
     # (webcam index 0 unless --source is given).
     source: Optional[str] = None
+
+    # Clockwise frame rotation applied at the capture edge, before
+    # detection: 0, 90, 180 or 270 degrees. Changing it also rotates the
+    # active calibration geometry (mapping or legacy pixels) so the same
+    # physical scene region stays covered. See app/orientation.py.
+    rotation: int = 0
 
     # Queue-movement classification: the queue is MOVING when at least
     # `movement_min_events` line crossings happen inside `movement_window_s`.
@@ -366,6 +387,9 @@ class CameraConfig:
             path=Path(path) if path else None,
             camera_id=str(cam.get("camera_id", "CAMERA 01") or "CAMERA 01"),
             source=str(cam["source"]) if cam.get("source") is not None else None,
+            # Clockwise capture rotation; invalid values fall back to 0
+            # rather than buckling the whole config load.
+            rotation=_parse_rotation(cam.get("rotation", 0)),
             movement_window_s=float(mov.get("window_s", 60.0) or 60.0),
             movement_min_events=int(mov.get("min_events", 1)),
             occupancy_avg_window_s=float(dash.get("occupancy_avg_window_s", 120.0) or 120.0),
@@ -828,6 +852,96 @@ class CongestionStopwatch:
         }
 
 
+
+@dataclass
+class _LostTrackRecord:
+    """Track information cached briefly when a track is lost inside the queue ROI."""
+    track_id: int
+    lost_unix: float
+    entry_unix: Optional[float]
+    entry_iso: Optional[str]
+    first_seen_unix: float
+    first_seen_iso: str
+    last_ref_point: Tuple[float, float]
+    conf: float
+
+
+class ServiceTimeTracker:
+    """Tracks inter-departure service time (Delta t) at the X-ray screening exit.
+
+    Applies Little's Law and queue service rate smoothing:
+    - Delta t = t_exit - t_prev_exit represents actual service duration per passenger.
+    - An Exponential Moving Average (EMA) filters noise while adapting to real flow.
+    - Estimated Wait Time: W_q = L_q * S_eff
+    - Estimated Queue Clearance Time: T_clear = L_q * S_eff
+    """
+
+    def __init__(self, baseline_service_s: float = 20.0, alpha: float = 0.25):
+        self.baseline_service_s = float(baseline_service_s)
+        self.alpha = float(alpha)
+        self.smoothed_service_s = float(baseline_service_s)
+        self.last_exit_unix: Optional[float] = None
+        self.exit_history: deque = deque(maxlen=20)
+        self.total_completed = 0
+
+    def record_exit(self, now_unix: float) -> float:
+        """Record an exit event and update smoothed service time."""
+        self.total_completed += 1
+        delta = None
+        if self.last_exit_unix is not None:
+            raw_delta = max(2.0, min(now_unix - self.last_exit_unix, 180.0))
+            delta = raw_delta
+            self.smoothed_service_s = (self.alpha * delta) + ((1.0 - self.alpha) * self.smoothed_service_s)
+            self.exit_history.append((now_unix, delta))
+        self.last_exit_unix = now_unix
+        return delta or self.smoothed_service_s
+
+    def effective_service_time_s(self, now_unix: float, queue_count: int) -> float:
+        """Effective service time with graceful decay if passenger is taking longer."""
+        base = self.smoothed_service_s
+        if queue_count > 0 and self.last_exit_unix is not None:
+            elapsed = now_unix - self.last_exit_unix
+            if elapsed > base:
+                base = min(base * 0.7 + elapsed * 0.3, 120.0)
+        return max(3.0, round(base, 1))
+
+    def estimate_wait_seconds(self, queue_count: int, now_unix: float) -> float:
+        """Estimated wait time for the next joining passenger: W_q = L_q * S_eff."""
+        if queue_count <= 0:
+            return 0.0
+        eff = self.effective_service_time_s(now_unix, queue_count)
+        return round(queue_count * eff, 1)
+
+    def estimate_clearance_seconds(self, queue_count: int, now_unix: float) -> float:
+        """Estimated time until the current queue is fully cleared."""
+        return self.estimate_wait_seconds(queue_count, now_unix)
+
+    def pacing_status(self, queue_count: int, now_unix: float) -> str:
+        """Pacing index: OPTIMAL | STEADY | SLOW_INSPECTION | STAGNANT | IDLE."""
+        if queue_count <= 0:
+            return "IDLE"
+        if self.last_exit_unix is not None and (now_unix - self.last_exit_unix) > 90.0:
+            return "STAGNANT"
+        eff = self.effective_service_time_s(now_unix, queue_count)
+        if eff <= 15.0:
+            return "OPTIMAL"
+        if eff > 35.0:
+            return "SLOW_INSPECTION"
+        return "STEADY"
+
+    def smoothed_rate_per_min(self, now_unix: float, queue_count: int) -> float:
+        """Throughput / clearance rate in passengers per minute."""
+        if queue_count <= 0 and (self.last_exit_unix is None or now_unix - self.last_exit_unix > 120.0):
+            return 0.0
+        eff = self.effective_service_time_s(now_unix, queue_count)
+        return round(60.0 / max(eff, 1.0), 1)
+
+    def smoothed_rate_per_hour(self, now_unix: float, queue_count: int) -> int:
+        """Throughput in passengers per hour."""
+        rate_min = self.smoothed_rate_per_min(now_unix, queue_count)
+        return int(round(rate_min * 60.0))
+
+
 # ---------------------------------------------------------------------
 #  ANALYTICS ENGINE
 # ---------------------------------------------------------------------
@@ -855,6 +969,16 @@ class QueueAnalytics:
         self._prev_state = UNCONFIGURED
         self._state_start_unix: Optional[float] = None
         self.occupancy_series: deque = deque()
+        # Airport X-Ray Service Rate & Little's Law Tracker
+        self.service_tracker = ServiceTimeTracker(
+            baseline_service_s=(
+                60.0 / self.config.baseline_people_per_minute
+                if getattr(self.config, "baseline_people_per_minute", None)
+                else 20.0
+            )
+        )
+        # Brief spatial memory for tracks temporarily lost in ROI (occlusion recovery)
+        self._lost_roi_tracks: Dict[int, _LostTrackRecord] = {}
         # Resolved per-frame geometry (ROI in native pixels, counting
         # lines in native pixels, tracking reference point). Recomputed
         # on the first track of the frame, cached for the rest of it, so
@@ -966,8 +1090,32 @@ class QueueAnalytics:
 
             ps = self.persons.get(tid)
             if ps is None:
-                ps = PersonState(track_id=tid, first_seen_unix=now_unix, first_seen_iso=now_iso)
-                self.persons[tid] = ps
+                # Check spatial continuity with lost ROI tracks (occlusion recovery)
+                inside_candidate = _in_polygon(ref_point[0], ref_point[1], geom["roi"]) if geom["roi"] else False
+                if inside_candidate and self._lost_roi_tracks:
+                    best_tid = None
+                    min_dist = float("inf")
+                    for l_tid, l_rec in list(self._lost_roi_tracks.items()):
+                        if now_unix - l_rec.lost_unix <= (self.config.track_lost_grace_seconds * 3.0):
+                            d = math.hypot(ref_point[0] - l_rec.last_ref_point[0], ref_point[1] - l_rec.last_ref_point[1])
+                            if d < min_dist and d <= 90.0:
+                                min_dist = d
+                                best_tid = l_tid
+                    if best_tid is not None:
+                        l_rec = self._lost_roi_tracks.pop(best_tid)
+                        ps = PersonState(
+                            track_id=tid,
+                            first_seen_unix=l_rec.first_seen_unix,
+                            first_seen_iso=l_rec.first_seen_iso,
+                            entry_unix=l_rec.entry_unix,
+                            entry_iso=l_rec.entry_iso,
+                            inside_roi=True,
+                        )
+                        self.persons[tid] = ps
+
+                if ps is None:
+                    ps = PersonState(track_id=tid, first_seen_unix=now_unix, first_seen_iso=now_iso)
+                    self.persons[tid] = ps
             ps.last_seen_unix = now_unix
             ps.conf = track_confs.get(tid, ps.conf)
             ps.centroid = (cx, cy)
@@ -1048,6 +1196,11 @@ class QueueAnalytics:
         events += self.stopwatch.update(state, now_unix)
         self.event_log.extend(events)
 
+        pred_wait = self.service_tracker.estimate_wait_seconds(occupancy, now_unix)
+        clearance_s = self.service_tracker.estimate_clearance_seconds(occupancy, now_unix)
+        pacing = self.service_tracker.pacing_status(occupancy, now_unix)
+        eff_service_s = self.service_tracker.effective_service_time_s(now_unix, occupancy)
+
         return {
             "timestamp": now_iso,
             "frame_count": self.frame_count,
@@ -1076,7 +1229,15 @@ class QueueAnalytics:
             "movement": self._movement(occupancy, now_unix),
             "state_duration_s": round(state_duration_s, 3),
             "flow": flow,
-            "waiting": {"average_s": round(avg_wait, 3), "longest_s": round(longest_wait, 3), "active": occupancy},
+            "waiting": {
+                "average_s": round(avg_wait, 3),
+                "longest_s": round(longest_wait, 3),
+                "predicted_s": round(pred_wait, 1),
+                "clearance_s": round(clearance_s, 1),
+                "active": occupancy,
+            },
+            "pacing": pacing,
+            "service_time_s": eff_service_s,
             "spacing": spacing,
             "raw_density": {
                 "people_per_px2": raw_density,
@@ -1106,7 +1267,23 @@ class QueueAnalytics:
                         "inside_roi_at_loss": ps.inside_roi,
                         "label": f"Tracking lost (person #{tid})",
                     })
+                    if ps.inside_roi:
+                        self._lost_roi_tracks[tid] = _LostTrackRecord(
+                            track_id=tid,
+                            lost_unix=now_unix,
+                            entry_unix=ps.entry_unix,
+                            entry_iso=ps.entry_iso,
+                            first_seen_unix=ps.first_seen_unix,
+                            first_seen_iso=ps.first_seen_iso,
+                            last_ref_point=ps.last_ref_point,
+                            conf=ps.conf,
+                        )
                 del self.persons[tid]
+        # Clean stale records from _lost_roi_tracks
+        max_lost_age = max(5.0, self.config.track_lost_grace_seconds * 3.0)
+        for old_tid in list(self._lost_roi_tracks.keys()):
+            if now_unix - self._lost_roi_tracks[old_tid].lost_unix > max_lost_age:
+                del self._lost_roi_tracks[old_tid]
         return events
 
     def _handle_crossing(self, ps, ref_point, now_unix, events, geom=None):
@@ -1220,6 +1397,7 @@ class QueueAnalytics:
                 ps.exit_iso = iso_from_unix(now_unix)
                 self.total_exits += 1
                 self.exit_timestamps.append(now_unix)
+                self.service_tracker.record_exit(now_unix)
                 label = f"Cleared screening (person #{ps.track_id})"
             else:
                 ps.entry_unix = now_unix
@@ -1244,7 +1422,11 @@ class QueueAnalytics:
             "waiting_s": waiting_s,
             "confidence": ps.conf,
             "label": label or (
-                f"Reversed crossing ({wire_direction.lower()}) on {ident} (person #{ps.track_id})"
+                # Operator language: a person moving back across a line.
+                # The engineering wording stays on the technical field.
+                "Passenger moved back across the "
+                + ("entry" if wire_direction == "ENTER" else "exit")
+                + " line"
             ),
         }
 
@@ -1278,6 +1460,9 @@ class QueueAnalytics:
                 continue
             out[f"avg_{m}min_per_min"] = round(sum(1 for ts in self.exit_timestamps if ts >= now_unix - m * 60) / m, 3)
             out[f"entry_avg_{m}min_per_min"] = round(sum(1 for ts in self.entry_timestamps if ts >= now_unix - m * 60) / m, 3)
+        queue_count = sum(1 for ps in self.persons.values() if ps.inside_roi and ps.exit_unix is None)
+        out["smoothed_rate_per_min"] = self.service_tracker.smoothed_rate_per_min(now_unix, queue_count)
+        out["smoothed_rate_per_hour"] = self.service_tracker.smoothed_rate_per_hour(now_unix, queue_count)
         return out
 
     def _movement(self, occupancy: int, now_unix) -> str:
@@ -1862,6 +2047,19 @@ class SystemMetrics:
     #: Epoch seconds of the newest captured frame (0 = not measured yet).
     #: Used to report the real frame age instead of assuming one interval.
     last_frame_unix: float = 0.0
+    # ── Camera identity/orientation actually running (additive) ─────
+    #: The *running* source, which a CLI --source override can differ
+    #: from camera.yaml's persisted value.
+    source_index: Optional[int] = None
+    #: Operator-facing camera chrome label (e.g. "CAM-01").
+    source_label: str = ""
+    #: Clockwise rotation currently applied at the capture edge.
+    rotation_deg: int = 0
+    #: Actual frame size being analysed (post-rotation when rotation ≠ 0;
+    #: 0 = not measured yet). Snapshot resolution reporting prefers these
+    #: measured values over the requested config width/height.
+    frame_w: int = 0
+    frame_h: int = 0
 
 
 @dataclass
@@ -1881,6 +2079,10 @@ class QueueMetrics:
     total_exits: int = 0
     avg_wait_s: float = 0.0
     longest_wait_s: float = 0.0
+    predicted_wait_s: float = 0.0
+    clearance_time_s: float = 0.0
+    service_time_s: float = 0.0
+    pacing_status: str = "STEADY"
     movement: str = "IDLE"
     spacing_px: Optional[float] = None
     congestion_active: bool = False
@@ -1927,6 +2129,10 @@ def build_dashboard_model(snapshot, system, config, recent_events=None) -> Dashb
         total_exits=snapshot.get("total_exits", 0),
         avg_wait_s=float(waiting.get("average_s", 0) or 0),
         longest_wait_s=float(waiting.get("longest_s", 0) or 0),
+        predicted_wait_s=float(waiting.get("predicted_s", 0) or 0),
+        clearance_time_s=float(waiting.get("clearance_s", 0) or 0),
+        service_time_s=float(snapshot.get("service_time_s", 0) or 0),
+        pacing_status=str(snapshot.get("pacing", "STEADY")),
         movement=snapshot.get("movement", "IDLE"),
         spacing_px=spacing.get("average_px"),
         congestion_active=bool(cong.get("active")),

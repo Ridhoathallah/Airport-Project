@@ -43,8 +43,24 @@ record:
 
 test:
 	$(PY) -m unittest discover -s tests
+	@$(PY) -c "import pytest" 2>/dev/null \
+	  && $(PY) -m pytest tests -q \
+	  || echo "pytest is not installed: skipping the pytest-style test files"
+
+# Only the unittest-style tests (TestCase classes).
+test-unittest:
+	$(PY) -m unittest discover -s tests
+
+# Only the pytest-style tests (function tests). These cover the history
+# buffer, the dashboard adapter, the dashboard API and the dashboard models.
+test-pytest:
+	$(PY) -m pytest tests -q
 
 smoke:
+	@# Always start from the clean vendored image: a previous run must never
+	@# leave an annotated frame behind as the next run's input.
+	@mkdir -p output/smoke_test
+	@cp -f yolov5/data/images/bus.jpg output/smoke_test/bus.jpg
 	$(PY) app/detect_people.py --source output/smoke_test/bus.jpg
 
 test-camera:

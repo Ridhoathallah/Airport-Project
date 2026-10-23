@@ -30,6 +30,12 @@ export interface CameraHealth {
   packetLoss: number | null; // %  null = not measured by this pipeline
   lastFrameAgeMs: number;
   uptimeSec: number;
+  /** Camera chrome label reported by the pipeline, e.g. "CAM-01". */
+  sourceLabel: string;
+  /** Live webcam index; null for file/IP/image sources. */
+  sourceIndex: number | null;
+  /** Clockwise rotation applied at the capture edge (degrees). */
+  rotationDeg: number;
 }
 
 export interface CvHealth {
@@ -124,6 +130,10 @@ export interface Snapshot {
   throughput: number; // per hr
   /** Operational guidance for the current condition, in operator language. */
   action?: string;
+  predictedWait?: number; // min (Little's Law queue wait estimation)
+  clearanceTime?: number; // min (estimated queue clearance time)
+  serviceTimeS?: number; // seconds per passenger
+  pacingStatus?: "OPTIMAL" | "STEADY" | "SLOW_INSPECTION" | "STAGNANT" | "IDLE";
   camera: CameraHealth;
   cv: CvHealth;
   recording: { active: boolean; sinceSec: number | null; sizeGb: number | null };
@@ -395,6 +405,17 @@ function build(s: SimState, scenario: Scenario): Snapshot {
   const congestionSec = s.congestionSince ? Math.round((s.now - s.congestionSince) / 1000) : 0;
   const avgWait = last.avgWait;
   const longestWait = +(avgWait * 1.7 + 0.8).toFixed(1);
+  const serviceTimeS = +(60 / Math.max(last.exitRate, 0.5)).toFixed(1);
+  const predictedWait = +(last.queue * (serviceTimeS / 60)).toFixed(1);
+  const clearanceTime = predictedWait;
+  const pacingStatus =
+    last.queue === 0
+      ? "IDLE"
+      : serviceTimeS <= 15
+        ? "OPTIMAL"
+        : serviceTimeS > 35
+          ? "SLOW_INSPECTION"
+          : "STEADY";
 
   const camera: CameraHealth = offline
     ? {
@@ -405,6 +426,9 @@ function build(s: SimState, scenario: Scenario): Snapshot {
         packetLoss: 100,
         lastFrameAgeMs: 8400,
         uptimeSec: s.uptimeSec,
+        sourceLabel: "CAM-01",
+        sourceIndex: 0,
+        rotationDeg: 0,
       }
     : {
         link: degraded ? "DEGRADED" : "ONLINE",
@@ -414,6 +438,9 @@ function build(s: SimState, scenario: Scenario): Snapshot {
         packetLoss: degraded ? +(3.4 + noise(1)).toFixed(1) : +(0.1 + Math.random() * 0.2).toFixed(1),
         lastFrameAgeMs: degraded ? Math.round(280 + noise(120)) : Math.round(48 + noise(20)),
         uptimeSec: s.uptimeSec,
+        sourceLabel: "CAM-01",
+        sourceIndex: 0,
+        rotationDeg: 0,
       };
 
   const cv: CvHealth = offline
@@ -459,6 +486,10 @@ function build(s: SimState, scenario: Scenario): Snapshot {
     trend,
     avgWait,
     longestWait,
+    predictedWait,
+    clearanceTime,
+    serviceTimeS,
+    pacingStatus,
     throughput: Math.round(last.exitRate * 60),
     action: offline ? undefined : SIM_ACTIONS[state],
     camera,
@@ -525,6 +556,10 @@ function convertApiSnapshot(api: SnapshotResponse): Snapshot {
     trend: queue.trend,
     avgWait: queue.avg_wait,
     longestWait: queue.longest_wait,
+    predictedWait: queue.predicted_wait,
+    clearanceTime: queue.clearance_time,
+    serviceTimeS: queue.service_time_s,
+    pacingStatus: queue.pacing_status,
     throughput: queue.throughput,
     action: queue.action,
     camera: {
@@ -535,6 +570,9 @@ function convertApiSnapshot(api: SnapshotResponse): Snapshot {
       packetLoss: camera.packet_loss,
       lastFrameAgeMs: camera.last_frame_age_ms,
       uptimeSec: camera.uptime_sec,
+      sourceLabel: camera.source_label || "CAM-01",
+      sourceIndex: camera.source_index,
+      rotationDeg: camera.rotation_deg ?? 0,
     },
     cv: {
       detection: cv.detection_status as PipelineStatus,
@@ -608,6 +646,9 @@ export function createOfflineSnapshot(errorMsg = "API disconnected"): Snapshot {
       packetLoss: null,
       lastFrameAgeMs: 0,
       uptimeSec: 0,
+      sourceLabel: "",
+      sourceIndex: null,
+      rotationDeg: 0,
     },
     cv: {
       detection: "STALLED",

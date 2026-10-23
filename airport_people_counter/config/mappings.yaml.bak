@@ -1,0 +1,35 @@
+schema_version: 1
+cameras:
+  CAMERA 01:
+    schema_version: 1
+    camera_id: CAMERA 01
+    roi:
+    - - 0.125
+      - 0.13888900000000004
+    - - 0.875
+      - 0.13888900000000004
+    - - 0.875
+      - 0.722222
+    - - 0.125
+      - 0.722222
+    lines:
+    - id: in
+      points:
+      - - 0.875
+        - 0.777778
+      - - 0.125
+        - 0.777778
+      direction: IN
+    - id: out
+      points:
+      - - 0.125
+        - 0.777778
+      - - 0.875
+        - 0.777778
+      direction: OUT
+    reference_point: bottom_center
+    source_shape:
+      width: 1280
+      height: 720
+    created_at_iso: '2026-10-22T06:17:24Z'
+    updated_at_iso: '2026-10-22T06:17:24Z'

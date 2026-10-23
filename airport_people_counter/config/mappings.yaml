@@ -1,67 +1,35 @@
-# ============================================================
-# Camera mapping store (camera-relative geometry, normalised)
-# ============================================================
-#
-# This file holds the queue ROI polygon and the separate IN / OUT
-# virtual counting lines a technician draws on a camera frame.
-#
-# Rules of this file:
-#   * Coordinates are NORMALISED to the range [0, 1] relative to the
-#     active frame, so a resolution change cannot detach the mapping
-#     from the real scene. `source_shape` records the frame the
-#     coordinates were drawn against, for diagnostics and cross-checks.
-#   * `schema_version` is bumped only by a change to the schema in
-#     `app/mapping.py` — never by hand here.
-#   * `cameras` is keyed by the operator-facing `camera_id` from
-#     config/camera.yaml. Currently only "CAMERA 01" is in scope;
-#     additional entries are forward-compatible but inactive.
-#   * While a camera's entry here is valid, it is the SINGLE ACTIVE
-#     GEOMETRY SOURCE. The `counting_line` / `xray_side_point`
-#     geometry in config/camera.yaml is only used as a legacy
-#     fallback when no valid mapping exists here.
-#
-# Do not edit while the analytics pipeline is tracking people: a
-# running pipeline will ignore changes until it re-reads config —
-# press 'r' in the standalone window, or use the dashboard mapping
-# endpoint (`PUT /api/dashboard/mapping`).
-
 schema_version: 1
-
 cameras:
-
-  # ── Airport X-Ray Screening Queue — Camera 01 ───────────────
   CAMERA 01:
+    schema_version: 1
+    camera_id: CAMERA 01
     roi:
-      # Queue ROI, polygon vertices in [x, y] normalised units.
-      #-Calibrated for laptop camera 1280x720 demo scene.
-      - [0.125, 0.138889]
-      - [0.875, 0.138889]
-      - [0.875, 0.722222]
-      - [0.125, 0.722222]
-
+    - - 0.125
+      - 0.13888900000000004
+    - - 0.875
+      - 0.13888900000000004
+    - - 0.888702201622248
+      - 0.7222943221320973
+    - - 0.125
+      - 0.722222
     lines:
-
-      in:
-        # Entering the positive side of this line counts as an IN event
-        # (a passenger joins the queue). The positive side is the side
-        # the line's direction arrow points into.
-        points:
-          - [0.875, 0.777778]
-          - [0.125, 0.777778]
-        direction: IN
-
-      out:
-        # Entering the positive side of this line counts as an OUT
-        # event (a passenger clears screening). The positive side is
-        # the side towards the X-ray machine.
-        points:
-          - [0.125, 0.777778]
-          - [0.875, 0.777778]
-        direction: OUT
-
+    - id: in
+      points:
+      - - 0.8805330243337196
+        - 0.04401956997553753
+      - - 0.12615295480880648
+        - 0.05271275910905111
+      direction: IN
+    - id: out
+      points:
+      - - 0.11619930475086906
+        - 0.9107428865713918
+      - - 0.8699188876013905
+        - 0.8946337067078666
+      direction: OUT
     reference_point: bottom_center
-
     source_shape:
-      # Frame the coordinates were calibrated against (1280 x 720).
       width: 1280
       height: 720
+    created_at_iso: '2026-10-22T06:18:46Z'
+    updated_at_iso: '2026-10-22T06:18:46Z'

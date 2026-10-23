@@ -23,6 +23,13 @@ class CameraState(BaseModel):
     fps: float
     resolution: str
     frame_age_ms: int
+    #: Camera chrome label actually reported by the pipeline ("" = legacy
+    #: process or unknown).
+    source_label: str = ""
+    #: Live webcam index (None for file/IP/image sources).
+    source_index: Optional[int] = None
+    #: Clockwise rotation applied at the capture edge.
+    rotation_deg: int = 0
 
 
 class Track(BaseModel):

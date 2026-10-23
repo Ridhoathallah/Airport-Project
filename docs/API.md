@@ -253,7 +253,7 @@ additive to the `/api/*` endpoints above and return the
 | `recording` | RecordingTelemetry | Recording subsystem state |
 | `last_known_queue` | integer | Last trustworthy queue reading (used while offline) |
 | `last_update` | integer | Epoch ms of the snapshot |
-| `history` | Sample[] | Rolling history (240 samples) |
+| `history` | Sample[] | Evenly downsampled view of the 60-minute history buffer (≤ 240 points; full detail via `GET /api/dashboard/history`) |
 | `events` | EventInfo[] | Recent operator events |
 | `tracks` | TrackInfo[] | Normalized track boxes (0..1) |
 | `frame_ts` | integer | Epoch ms of the frame the snapshot was built from |
@@ -344,6 +344,62 @@ calibration). Camera-capable by design; the UI currently drives
 **Response:** `applied`, `camera_id`, `errors`, `backup_path` (only when an
 existing store was replaced), `mapping_active`, `reference_point`.
 
+### GET /api/dashboard/camera/sources
+
+**Purpose:** List candidate camera inputs with a light availability probe.
+Webcam indexes 0–4 are probed (≤3 s each, cached for 10 s); a video file or
+URL source is reported from `camera.source` without probing. The currently
+running source is marked available without probing (the pipeline already
+holds it).
+
+**Response:**
+
+```json
+{
+  "sources": [
+    {"index": 0, "available": true, "running": true},
+    {"index": 1, "available": true, "running": false},
+    {"index": 2, "available": false, "running": false}
+  ],
+  "active_index": 0
+}
+```
+
+### POST /api/dashboard/camera/select
+
+**Purpose:** Hot-switch the active camera source (no restart).
+**Body:** `{"index": <int>}`
+**Response:** `CameraControlResult`:
+
+```json
+{"applied": true, "camera_id": "CAMERA 01", "source_index": 1, "rotation_deg": 0, "errors": []}
+```
+
+**Behaviour:** the target is probed first — an unavailable index returns
+`applied: false` with an error and nothing is changed: the pipeline keeps
+the current source. A valid switch persists `camera.source` in
+`camera.yaml` (atomic write with a `.bak` backup), then the detection loop
+opens the new device; the old stream is released only after the new one
+delivers frames.
+
+### POST /api/dashboard/camera/rotation
+
+**Purpose:** Rotate the image stream clockwise ahead of detection
+(0 / 90 / 180 / 270). Detection, snapshots, MJPEG streams and dashboard
+overlays all see the rotated frame; calibrated geometry rotates with it so
+the same physical region stays covered.
+**Body:** `{"degrees": 0 | 90 | 180 | 270}`
+**Response:** `CameraControlResult` (as above, with the new
+`rotation_deg`).
+
+**Behaviour:** with an active `mappings.yaml` entry the normalized mapping
+(`roi`, lines) is rotated and persisted via the mapping store; with legacy
+`camera.yaml` pixel geometry the stored points rotate in place, plus
+`camera.rotation`, in one atomic write — the in-memory derived legacy
+mapping is never persisted back. A same-value request is a no-op success.
+Operator events: `camera_rotation` → "Image rotation changed" and
+`camera_switch` → "Camera source changed" (kind `system`).
+
 ### GET /api/dashboard/health
 
 **Purpose:** Liveness of the API and the camera.
@@ -352,7 +408,10 @@ existing store was replaced), `mapping_active`, `reference_point`.
 ### GET /api/dashboard/history
 
 **Purpose:** The rolling history buffer as plain samples.
-**Response:** `{"samples": [Sample, ...]}` — at most 240 entries.
+**Query:** `points` (integer, 2–3600, default `240`) — the buffer holds one
+sample per second for the last 60 minutes (3600); the response is evenly
+downsampled to `points`.
+**Response:** `{"samples": [Sample, ...]}`.
 
 ### POST /api/shutdown
 
@@ -441,8 +500,11 @@ completed within 10 s, and says so in the log. The endpoint never calls
 |-------|------|-------------|
 | `link` | string | `"ONLINE"` \| `"OFFLINE"` \| `"DEGRADED"` |
 | `fps` | number | Camera capture FPS |
-| `resolution` | string | `"WxH"` format |
+| `resolution` | string | `"WxH"` of the measured (post-rotation) frame |
 | `frame_age_ms` | integer | Estimated frame interval (ms) |
+| `source_label` | string | Display label: `CAM-0N` for webcams, file basename for files, `IP-CAM` for network streams |
+| `source_index` | integer \| null | Webcam index while a webcam is active |
+| `rotation_deg` | integer | Active clockwise rotation (0/90/180/270) |
 
 ---
 
@@ -454,32 +516,38 @@ completed within 10 s, and says so in the log. The endpoint never calls
 // vite.config.ts
 proxy: {
   '/api': {
-    target: 'http://localhost:8080',
+    target: process.env.API_PROXY_TARGET || 'http://localhost:8080',
     changeOrigin: true,
     rewrite: (path) => path,  // Keep /api prefix
   },
 }
 ```
 
-Dashboard fetches `/api/snapshot` → Vite proxies to `http://localhost:8080/api/snapshot`
+Dashboard requests like `GET /api/dashboard/snapshot` → Vite proxies to
+`http://localhost:8080/api/dashboard/snapshot`.
 
 ### TypeScript Client (src/lib/api.ts)
 
 ```typescript
 // Polling at 1 Hz
-const apiSnap = await getSnapshot();  // GET /api/snapshot
-const config = await getConfig();     // GET /api/config
-const health = await getHealth();     // GET /api/health
+const apiSnap = await getSnapshot();  // GET /api/dashboard/snapshot
+const config = await getConfig();     // GET /api/dashboard/config
+const health = await getHealth();     // GET /api/dashboard/health
 
-// MJPEG stream
-<img src={getVideoStreamUrl()} />     // /api/camera/stream
+// MJPEG streams
+getVideoStreamUrl(true);   // /api/camera/stream            (annotated)
+getVideoStreamUrl(false);  // /api/camera/stream?annotated=0 (raw, calibration)
+
+// Mapping editor
+getMapping();                          // GET  /api/dashboard/mapping
+putMapping(payload);                   // PUT  /api/dashboard/mapping
 ```
 
-### React Hook (src/lib/telemetry.ts)
+### React Hooks (src/lib/telemetry.ts)
 
 ```typescript
-const { snap, error, refetch } = useRealTelemetry(1000); // 1 Hz poll
-// Returns internal Snapshot type (converted from API response)
+const { snap, error, refetch } = useRealTelemetry(1000); // 1 Hz poll, API → Snapshot
+const [config, refresh] = useCameraConfig();             // config + re-fetch after Save
 ```
 
 ---

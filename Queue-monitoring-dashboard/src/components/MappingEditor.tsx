@@ -117,6 +117,12 @@ export default function MappingEditor({
     items: problems.filter((p) => p.field === id),
   }));
 
+  // Editing after a refused save drops the stale server feedback: the
+  // live problem list above already describes the current draft.
+  useEffect(() => {
+    if (dirty && saveState && !saveState.ok) setSaveState(null);
+  }, [dirty, saveState]);
+
   // ── editing actions ─────────────────────────────────────────────
   const movePoint = useCallback(
     (kind: "roi" | LineId, index: number, u: number, v: number) => {
@@ -262,7 +268,17 @@ export default function MappingEditor({
   const ghost = previewSaved ? base : null;
 
   return (
-    <div className="absolute inset-0 z-20 flex flex-col bg-black" role="dialog" aria-label="Camera mapping editor">
+    /*
+      Below the desktop breakpoint the camera panel is too small to draw
+      in, so the editor becomes a full-screen calibration surface. Above
+      it the editor stays inside the camera panel, so the operator keeps
+      the monitoring context around it.
+    */
+    <div
+      className="fixed inset-0 z-30 flex flex-col bg-black xl:absolute xl:z-20"
+      role="dialog"
+      aria-label="Camera mapping editor"
+    >
       {/* raw feed, letterboxed (object-contain) so the editor shows the
           WHOLE frame: handle positions must stay reachable for cropping
           panel shapes — geometry coordinates cover the full frame. */}
@@ -347,24 +363,26 @@ export default function MappingEditor({
             {saveState.errors?.map((e, i) => <li key={i}>{e}</li>)}
           </ul>
         )}
-        {saveState?.ok && (
+        {saveState?.ok && !dirty && (
           <p className="mt-1.5 text-[12px]" style={{ color: "var(--st-normal)" }}>
             Mapping applied. The detector switched to it on the next frame.
           </p>
         )}
-        {!saveState?.ok && roiProblems.length > 0 && (
+        {/* The live problems always describe the draft in front of the
+            operator. Hiding them behind the last save result would leave
+            a disabled Save button with no reason shown. */}
+        {roiProblems.length > 0 && (
           <ul className="mt-1.5 list-inside list-disc text-[12px]" style={{ color: "var(--st-backlog)" }}>
             {roiProblems.map((p, i) => <li key={i}>{p.message}</li>)}
           </ul>
         )}
-        {!saveState?.ok &&
-          lineProblems.map(({ id, items }) =>
-            items.length > 0 ? (
-              <ul key={id} className="mt-1.5 list-inside list-disc text-[12px]" style={{ color: "var(--st-backlog)" }}>
-                {items.map((p, i) => <li key={i}>{p.message}</li>)}
-              </ul>
-            ) : null,
-          )}
+        {lineProblems.map(({ id, items }) =>
+          items.length > 0 ? (
+            <ul key={id} className="mt-1.5 list-inside list-disc text-[12px]" style={{ color: "var(--st-backlog)" }}>
+              {items.map((p, i) => <li key={i}>{p.message}</li>)}
+            </ul>
+          ) : null,
+        )}
 
         <div className="mt-2 flex flex-wrap items-center gap-xs">
           <button

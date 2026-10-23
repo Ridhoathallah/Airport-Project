@@ -1,7 +1,8 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { X, Camera, Activity, Sliders, ShieldCheck, Terminal, Power } from "lucide-react";
 import type { Snapshot, Scenario } from "../lib/telemetry";
-import type { ConfigResponse } from "../lib/api";
+import type { CameraSourceInfo, ConfigResponse } from "../lib/api";
+import { getCameraSources, selectCameraSource, setCameraRotation } from "../lib/api";
 import { StatusMark, healthStyle, QUEUE_STYLE, fmtDuration, fmtClock, type StatusStyle } from "../lib/ui";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,11 +72,11 @@ export function OperatorHealth({
   return (
     <div className="flex items-center gap-md">
       <HealthItem label="Camera" status={healthStyle(s.camera.link)} />
-      <span className="h-4 w-px bg-border-primary" aria-hidden />
+      <span className="h-4 w-px bg-rule" aria-hidden />
       <HealthItem label="Monitoring" status={monitoringStyle(s)} />
-      <span className="h-4 w-px bg-border-primary" aria-hidden />
+      <span className="h-4 w-px bg-rule" aria-hidden />
       <HealthItem label="Recording" status={recStyle(s)} />
-      <span className="h-4 w-px bg-border-primary" aria-hidden />
+      <span className="h-4 w-px bg-rule" aria-hidden />
       <HealthItem label="Data" status={dataStyle(s)} />
       <button
         type="button"
@@ -127,6 +128,143 @@ function Row({ label, value, state }: { label: string; value?: string; state?: S
 }
 
 const SCENARIOS: Scenario[] = ["NORMAL", "BUSY", "CONGESTED", "BACKLOG", "DEGRADED", "OFFLINE"];
+
+const ROTATION_OPTIONS = [0, 90, 180, 270] as const;
+const CAMERA_SOURCES_COUNT = 5;
+
+/**
+ * Which webcam feeds the lane and how the captured image is oriented.
+ *
+ * Set rarely (after a camera move or remount), so the controls live in
+ * diagnostics, not on the operator surface. The buttons act on the API
+ * endpoints; the truth rows above (source, rotation) always come from
+ * the pipeline snapshot. Controls are hidden while the simulated data
+ * feed is selected — a control panel on generated numbers would be a lie.
+ */
+function CameraInputGroup({
+  rotationDeg,
+  runningIndex,
+}: {
+  rotationDeg: number;
+  runningIndex: number | null;
+}) {
+  const [sources, setSources] = useState<CameraSourceInfo[] | null>(null);
+  const [busy, setBusy] = useState<"" | "switch" | "rotation">("");
+  const [error, setError] = useState<string | null>(null);
+
+  const loadSources = useCallback(() => {
+    getCameraSources()
+      .then((r) => {
+        setSources(r.sources);
+        setError(null);
+      })
+      .catch((e: Error) => setError(e.message));
+  }, []);
+
+  useEffect(() => {
+    loadSources();
+  }, [loadSources]);
+
+  async function applySwitch(index: number) {
+    if (busy) return;
+    setBusy("switch");
+    setError(null);
+    try {
+      const r = await selectCameraSource(index);
+      if (!r.applied) setError(r.errors.join(" ") || "Camera switch failed.");
+      else loadSources();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function applyRotation(degrees: number) {
+    if (busy || degrees === rotationDeg) return;
+    setBusy("rotation");
+    setError(null);
+    try {
+      const r = await setCameraRotation(degrees);
+      if (!r.applied) setError(r.errors.join(" ") || "Rotation change failed.");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  const placeholder = Array.from(
+    { length: CAMERA_SOURCES_COUNT },
+    (_, i) => ({ index: i, available: false, running: false }),
+  );
+
+  return (
+    <Group title="Camera input" icon={<Camera size={13} />}>
+      <div className="px-md py-xs">
+        <div className="text-[12px] text-text-secondary">Camera source</div>
+        <div className="flex flex-wrap gap-xs pb-sm pt-xs">
+          {(sources ?? placeholder).map((src) => {
+            const active = src.running && src.index === runningIndex;
+            return (
+              <button
+                key={src.index}
+                type="button"
+                className="ctl h-7 px-sm text-[11px]"
+                data-active={active}
+                disabled={!src.available || busy !== ""}
+                onClick={() => applySwitch(src.index)}
+                title={
+                  src.available
+                    ? `Switch to camera ${src.index}`
+                    : `Camera ${src.index} is not available`
+                }
+              >
+                {`CAM-${String(src.index + 1).padStart(2, "0")}`}
+                {active && <span className="t-meta text-text-tertiary">live</span>}
+              </button>
+            );
+          })}
+          {sources === null && (
+            <span className="t-meta self-center text-text-tertiary">Detecting cameras…</span>
+          )}
+        </div>
+      </div>
+      <div className="px-md pt-xs">
+        <div className="text-[12px] text-text-secondary">Image rotation</div>
+        <div className="flex gap-xs pb-sm pt-xs">
+          {ROTATION_OPTIONS.map((deg) => (
+            <button
+              key={deg}
+              type="button"
+              className="ctl h-7 flex-1 justify-center px-0 text-[11px]"
+              data-active={rotationDeg === deg}
+              disabled={busy !== ""}
+              onClick={() => applyRotation(deg)}
+            >
+              {`${deg}°`}
+            </button>
+          ))}
+        </div>
+      </div>
+      {busy !== "" && (
+        <p className="border-t border-border-primary px-md py-xs text-[11px] text-text-tertiary">
+          {busy === "switch" ? "Switching camera…" : "Rotating image…"}
+        </p>
+      )}
+      {error !== null && (
+        <p
+          className="border-t border-border-primary px-md py-xs text-[11px] font-medium"
+          style={{ color: "var(--st-busy)" }}
+          role="alert"
+        >
+          {error}
+        </p>
+      )}
+    </Group>
+  );
+}
+
 
 export function DiagnosticsDrawer({
   s,
@@ -272,6 +410,15 @@ export function DiagnosticsDrawer({
 
           <Group title="Camera feed" icon={<Camera size={13} />}>
             <Row label="Connection" state={healthStyle(c.link)} />
+            <Row label="Source" value={c.sourceLabel && c.sourceLabel !== "" ? c.sourceLabel : "Not reported"} />
+            <Row
+              label="Image rotation"
+              value={
+                c.rotationDeg
+                  ? `${c.rotationDeg}° clockwise`
+                  : "None (upright)"
+              }
+            />
             <Row label="Resolution" value={c.resolution} />
             <Row label="Frame rate" value={`${s.stateActive ? c.fps : 0} fps`} />
             <Row label="Latency" value={c.latencyMs === null ? "Not measured" : `${c.latencyMs} ms`} />
@@ -279,6 +426,16 @@ export function DiagnosticsDrawer({
             <Row label="Last frame" value={lastFrameLabel(s)} />
             <Row label="Uptime" value={fmtDuration(c.uptimeSec)} />
           </Group>
+
+          {/* Setup controls live in diagnostics, off the operator surface.
+              Not offered on the simulated feed: controls on generated data
+              would be a lie. */}
+          {dataSource === "api" && (
+            <CameraInputGroup
+              rotationDeg={c.rotationDeg ?? 0}
+              runningIndex={c.sourceIndex}
+            />
+          )}
 
           <Group title="Queue geometry" icon={<Sliders size={13} />}>
             <Row
@@ -315,7 +472,7 @@ export function DiagnosticsDrawer({
             <Row label="Tracking" state={healthStyle(cv.tracking)} />
             <Row label="Detection model" value={cv.model} />
             <Row label="Tracking method" value={cv.tracker} />
-            <Row label="Inference" value={`${cv.inferenceMs} ms`} />
+            <Row label="Inference" value={`${cv.inferenceMs.toFixed(1)} ms`} />
             <Row label="Device" value={cv.device || "Not reported"} />
             <Row label="People detected" value={`${cv.detections}`} />
             <Row label="Active tracks" value={`${cv.activeTracks}`} />
@@ -365,7 +522,7 @@ export function DiagnosticsDrawer({
                       aria-pressed={active}
                       className={`flex flex-col items-start gap-0.5 rounded-corner-sm border p-sm text-left transition-colors ${
                         active
-                          ? "border-border-control bg-bg-subtle"
+                          ? "border-control bg-bg-subtle"
                           : "border-border-primary bg-surface-secondary-bg hover:bg-bg-hover"
                       }`}
                     >

@@ -77,7 +77,7 @@ export function QueueStatusPanel({ s }: { s: Snapshot }) {
         ? "var(--st-normal)"
         : "var(--text-secondary)";
   const TrendIcon = trend === "GROWING" ? TrendingUp : trend === "CLEARING" ? TrendingDown : Minus;
-  const trendLabel = trend === "GROWING" ? "Naik" : trend === "CLEARING" ? "Turun" : "Stabil";
+  const trendLabel = trend === "GROWING" ? "Increasing" : trend === "CLEARING" ? "Decreasing" : "Stable";
 
   // The guidance line comes from the backend's recommendation table, so the
   // wording is configurable and never invented by the dashboard.
@@ -163,34 +163,59 @@ export function QueueStatusPanel({ s }: { s: Snapshot }) {
         </div>
       </div>
 
-      {/* Direction, average wait and the worst case, side by side. */}
-      <div className="grid shrink-0 grid-cols-3 border-t border-border-primary">
-        <StripCell label="Direction">
+      {/* Tactical Airport Metrics Strip: Trend, Little's Law Prediction, Clearance Time, Screening Pace */}
+      <div className="grid shrink-0 grid-cols-2 sm:grid-cols-4 border-t border-border-primary">
+        <StripCell label="Tren Alur">
           {active ? (
-            <span className="flex items-center gap-xs text-[17px] font-semibold" style={{ color: trendColor }}>
-              <TrendIcon size={15} aria-hidden />
+            <span className="flex items-center gap-xs text-[15px] font-semibold" style={{ color: trendColor }}>
+              <TrendIcon size={14} aria-hidden />
               {trendLabel}
             </span>
           ) : (
-            <span className="text-[17px] font-semibold text-text-tertiary">No signal</span>
+            <span className="text-[15px] font-semibold text-text-tertiary">No signal</span>
           )}
         </StripCell>
-        <StripCell label="Average wait">
-          <span className="t-meta text-[17px] font-semibold text-text-primary">
-            {active ? fmtMMSS(s.avgWait) : "--:--"}
+        <StripCell label="Est. Waktu Antrean">
+          <span className="t-meta text-[15px] font-semibold text-text-primary">
+            {active ? fmtMMSS(s.predictedWait ?? s.avgWait) : "--:--"}
           </span>
         </StripCell>
-        <StripCell label={critical ? "Congestion" : "Longest wait"}>
-          <span
-            className="t-meta text-[17px] font-semibold"
-            style={{ color: critical ? st.color : "var(--text-primary)" }}
-          >
-            {!active
-              ? "--:--"
-              : critical && s.congestionSec > 0
-                ? fmtDuration(s.congestionSec)
-                : fmtMMSS(s.longestWait)}
+        <StripCell label="Waktu Bersih">
+          <span className="t-meta text-[15px] font-semibold text-text-primary">
+            {active ? fmtMMSS(s.clearanceTime ?? s.avgWait) : "--:--"}
           </span>
+        </StripCell>
+        <StripCell label="Pacing X-Ray">
+          {(() => {
+            const pace = s.pacingStatus;
+            const paceColor =
+              pace === "OPTIMAL"
+                ? "var(--st-normal)"
+                : pace === "SLOW_INSPECTION"
+                  ? "var(--st-busy)"
+                  : pace === "STAGNANT"
+                    ? "var(--st-congested)"
+                    : active
+                      ? "var(--text-secondary)"
+                      : "var(--text-tertiary)";
+            const paceText =
+              !active
+                ? "No signal"
+                : pace === "IDLE"
+                  ? "Standby"
+                  : pace === "OPTIMAL"
+                    ? `Lancar (${s.serviceTimeS ?? 15}s)`
+                    : pace === "SLOW_INSPECTION"
+                      ? `Teliti (${s.serviceTimeS ?? 35}s)`
+                      : pace === "STAGNANT"
+                        ? "Tertahan (>90s)"
+                        : `Stabil (${s.serviceTimeS ?? 20}s)`;
+            return (
+              <span className="t-meta text-[15px] font-semibold" style={{ color: paceColor }}>
+                {paceText}
+              </span>
+            );
+          })()}
         </StripCell>
       </div>
     </section>
@@ -222,7 +247,6 @@ export function MetricGrid({ s }: { s: Snapshot }) {
           label="Entry rate"
           value={active ? fmt1(s.entryRate) : "--"}
           unit="/min"
-          accent="var(--chart-entry)"
           trend={
             active ? (
               <Sparkline data={h.map((d) => d.entryRate)} color="var(--chart-entry)" height={18} />
@@ -233,7 +257,6 @@ export function MetricGrid({ s }: { s: Snapshot }) {
           label="Exit rate"
           value={active ? fmt1(s.exitRate) : "--"}
           unit="/min"
-          accent="var(--chart-exit)"
           trend={
             active ? (
               <Sparkline data={h.map((d) => d.exitRate)} color="var(--chart-exit)" height={18} />
@@ -244,14 +267,13 @@ export function MetricGrid({ s }: { s: Snapshot }) {
           label="Throughput"
           value={active ? fmtInt(s.throughput) : "--"}
           unit="/hr"
-          accent="var(--st-normal)"
           footnote={active ? `${fmt1(s.exitRate)} cleared / min` : undefined}
         />
         <MetricTile
           label="Net change"
           value={active ? fmtSigned(net) : "--"}
           unit="/min"
-          accent={net > 0 ? "var(--st-congested)" : net < 0 ? "var(--st-normal)" : "var(--text-tertiary)"}
+          tone={active ? (net > 0 ? "var(--st-congested)" : net < 0 ? "var(--st-normal)" : undefined) : undefined}
           footnote={active ? (net > 0 ? "Filling" : net < 0 ? "Clearing" : "Balanced") : undefined}
         />
       </div>
@@ -317,7 +339,7 @@ export function AnalyticsPanel({
       // Below the two-column breakpoint the panel needs a height of its own:
       // a flex child with no height collapses to its header.
       className="h-[250px] shrink-0 min-h-0 xl:h-auto xl:flex-1"
-      bodyClassName="grid min-h-0 grid-cols-1 gap-px bg-border-primary md:grid-cols-2"
+      bodyClassName="grid min-h-0 grid-cols-1 gap-px bg-rule md:grid-cols-2"
     >
       <ChartCell title="Queue length" sub="people waiting">
         {active ? (
@@ -418,10 +440,11 @@ export function WaitingTimePanel({
     >
       <div className="flex shrink-0 items-center justify-between gap-lg px-md pt-md">
         <div className="flex items-baseline gap-lg">
-          <Stat label="Average" value={active ? fmtMMSS(s.avgWait) : "--:--"} />
-          <Stat label="Longest" value={active ? fmtMMSS(s.longestWait) : "--:--"} />
+          <Stat label="Est. Antrean (Little's Law)" value={active ? fmtMMSS(s.predictedWait ?? s.avgWait) : "--:--"} />
+          <Stat label="Rata-rata Berdiri" value={active ? fmtMMSS(s.avgWait) : "--:--"} />
+          <Stat label="Layanan per Pax" value={active ? `${s.serviceTimeS ?? 20}s` : "--"} />
         </div>
-        <span className="text-[11px] text-text-tertiary">Last {range}</span>
+        <span className="text-[11px] text-text-tertiary">Histori {range}</span>
       </div>
       <div className="min-h-0 flex-1 p-md">
         {active ? (
@@ -620,17 +643,17 @@ export function CameraPanel({
             }}
           />
         ) : (
-          <div
-            className="absolute inset-0"
-            style={{
-              background: "linear-gradient(180deg, #18202c 0%, #101620 55%, #0a0d13 100%)",
-              filter: offline
-                ? "grayscale(1) brightness(0.35)"
-                : degraded
+          !offline && (
+            <div
+              className="absolute inset-0"
+              style={{
+                background: "linear-gradient(180deg, #18202c 0%, #101620 55%, #0a0d13 100%)",
+                filter: degraded
                   ? "brightness(0.85) contrast(0.95)"
                   : "none",
-            }}
-          />
+              }}
+            />
+          )
         )}
 
         {/* Simulated geometry, so the simulator shows what the detector would. */}
@@ -695,7 +718,13 @@ export function CameraPanel({
             status panel above already names it, and a second copy collides
             with the detector's own queue-area caption. */}
         <div className="pointer-events-none absolute left-3 top-2.5 flex flex-col gap-1">
-          <span className="text-[11px] font-semibold text-white/85">CAM-01</span>
+          {/* Camera chrome follows the pipeline's running source; the
+              fallback keeps older server builds readable. */}
+          <span className="text-[11px] font-semibold text-white/85">
+            {s.camera.sourceLabel && s.camera.sourceLabel.trim() !== ""
+              ? s.camera.sourceLabel
+              : "CAM-01"}
+          </span>
           {degraded && !offline && (
             <span
               className="w-max rounded-corner-xs px-1 py-0.5 text-[10px] font-semibold"
@@ -711,8 +740,16 @@ export function CameraPanel({
 
         {!offline && (
           <div className="pointer-events-none absolute right-2.5 top-2.5 flex items-center gap-1.5">
-            <span className="live-dot h-1.5 w-1.5 rounded-full" style={{ background: "var(--st-backlog)" }} />
-            <span className="text-[10px] font-semibold tracking-widest text-white/80">LIVE</span>
+            {/* Simulator output is a generated scene, not a camera: it gets a
+                steady neutral marker and a different word. Only a real feed
+                gets the pulsing live dot. */}
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${isApi ? "live-dot" : ""}`}
+              style={{ background: isApi ? "var(--st-backlog)" : "var(--st-offline)" }}
+            />
+            <span className="text-[10px] font-semibold tracking-widest text-white/80">
+              {isApi ? "LIVE" : "DEMO"}
+            </span>
           </div>
         )}
 

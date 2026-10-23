@@ -1,340 +1,280 @@
 # Development Guide
 
+Practical guide: setup, commands, testing, validation, debugging. Architecture
+lives in [ARCHITECTURE.md](ARCHITECTURE.md); API contracts in
+[API.md](API.md); config schema in [CONFIGURATION.md](CONFIGURATION.md);
+dataset workflow in [DATASETS.md](DATASETS.md); product status in
+[PRD.md](PRD.md).
+
+## Prerequisites
+
+- **Python 3.9** (developed on 3.9.6); Apple Silicon uses MPS automatically
+- **Node.js 18+** (repo developed on 22.x) and **pnpm** (via corepack:
+  `corepack enable && corepack prepare pnpm@10.34.3 --activate`)
+- A camera (webcam / RTSP) or a video file; a real camera is optional for the
+  test suite (synthetic tracks only)
+- macOS camera permission must be granted to your terminal (System Settings →
+  Privacy & Security → Camera, then relaunch the terminal)
+
+## Installation 
+
+```bash
+# Backend — run.sh auto-creates the venv and installs dependencies
+cd airport_people_counter && ./run.sh --help
+
+# Or manually
+python3.9 -m venv venv
+venv/bin/pip install -r requirements/requirements.txt
+
+# Dashboard
+cd Queue-monitoring-dashboard && pnpm install
+```
+
+## Running the Application
+
+```bash
+# From the project root — starts pipeline (headless + API) and dashboard
+./start.sh                      # camera 0, dashboard http://localhost:8443
+./start.sh --source clip.mp4    # video file
+./start.sh --no-dashboard       # backend only
+./start.sh --lan                # dashboard exposed on the LAN
+Ctrl+C                          # stops both (reuses already-running services)
+```
+
+The launcher prints a status block (`YOLO / Camera / FastAPI / Dashboard`)
+where `Camera` honestly reports `NO SIGNAL` when no frames arrive.
+
+By default the dashboard is reachable on **localhost only**; pass `--lan`
+to expose it on the network.
+
+Service output is written to `.run/backend.log` and `.run/frontend.log`.
+The pipeline prints one status line per second to that log (the live
+per-frame line is only used on a terminal). Logs are rotated to a single
+`.1` file once they pass 8 MB, so a long-running deployment cannot fill
+the disk.
+
+Manual (two terminals):
+
+```bash
+# Terminal 1 — backend
+cd airport_people_counter
+./run.sh --headless --api --source 0        # or: make api
+
+# Terminal 2 — dashboard
+cd Queue-monitoring-dashboard
+pnpm dev                                     # http://localhost:8443
+```
+
+The dashboard starts in **LIVE** mode (proxied `/api` → `localhost:8080`);
+switch to **DEMO** in the top bar for simulator data. Image sources
+(`*.jpg`) are single-shot: streaming/hot-reload need camera or video sources.
+
+### Useful backend commands
+
+| Command | Purpose |
+|---------|---------|
+| `./run.sh --list-cameras` | Indices, resolution, measured FPS, device names |
+| `./run.sh --test-camera 0` | Camera FPS test without YOLO |
+| `./run.sh --define-roi` | Interactive legacy ROI/line setup (writes `camera.yaml`) |
+| `./run.sh --roi-preview` | Preview saved legacy layout |
+| `./run.sh --record output/events.jsonl` | Record events (JSONL) |
+| `./run.sh --record-samples output/samples.jsonl` | Record 1 Hz occupancy samples |
+| `./run.sh --conf 0.3 --imgsz 320 --fps 15` | Confidence / speed knobs |
+| `./run.sh --debug` / `--legacy-hud` | HUD variants |
+| `make run api test smoke …` | Makefile shortcuts (`make help`) |
+
+Full CLI: `./run.sh --help` (the `detect_people.py --help` flag list is the
+authority — do not duplicate it here).
+
+### Ports & environment variables
+
+| Item | Default | Override |
+|------|---------|----------|
+| FastAPI | `0.0.0.0:8080` | `--api-host`, `--api-port` |
+| Dashboard (Vite) | `8443` | `PORT` env var |
+| Vite `/api` proxy | `http://localhost:8080` | `API_PROXY_TARGET` env var |
+| Vite base URL | `/` | `FIGMA_PUBLIC_URL` (Figma hosting only) |
+
+No `.env` files are used and no secrets are configured anywhere.
+
 ## Repository Structure
 
 ```
 Airport-Project/
-├── docs/                           # Documentation (this directory)
-├── airport_people_counter/         # Python backend
-│   ├── app/                        # Camera-only prototype (current runtime)
-│   │   ├── detect_people.py        # Entry point: vision + CLI + rendering
-│   │   ├── queue_prototype.py      # Analytics: config, metrics, classifier, HUD
-│   │   ├── sort_tracker.py         # SORT tracker (Kalman + IoU)
-│   │   ├── snapshot.py             # Immutable snapshot dataclasses + builder
-│   │   ├── snapshot_holder.py      # Thread-safe snapshot + frame holder
-│   │   ├── api_models.py           # Pydantic models for FastAPI
-│   │   └── api_server.py           # FastAPI endpoints + MJPEG
-│   ├── core/                       # LEGACY multi-sensor engine (dormant)
-│   ├── config/                     # YAML configs
-│   ├── models/                     # Model weights (yolov5s.pt, YuNet)
-│   ├── scripts/                    # Offline evaluation
-│   ├── tests/                      # Unit tests (137 tests)
-│   ├── yolov5/                     # Vendored YOLOv5 repo
-│   ├── requirements/requirements.txt
-│   ├── run.sh                      # Launcher (auto venv)
-│   └── Makefile                    # Convenience targets
-│
-└── Queue-monitoring-dashboard/     # React/Vite frontend
-    ├── src/
-    │   ├── App.tsx                 # Root: source selector, layout
-    │   ├── main.tsx                # React entrypoint
-    │   ├── index.css               # Tailwind v4 import
-    │   ├── lib/
-    │   │   ├── telemetry.ts        # useTelemetry (sim) + useRealTelemetry (API)
-    │   │   ├── api.ts              # Typed fetch helpers
-    │   │   └── ui.ts               # Formatters, colors, components
-    │   └── components/
-    │       ├── sections.tsx        # QueueStatusPanel, CameraPanel, KpiStack...
-    │       ├── charts.tsx          # Sparkline, OccupancyChart, FlowChart
-    │       └── health.tsx          # OperatorHealth, DiagnosticsDrawer
-    ├── package.json
-    ├── vite.config.ts              # /api proxy → localhost:8080
-    └── tsconfig.json
+├── start.sh                     # Unified launcher (backend + dashboard)
+├── README.md, AGENTS.md         # Entry point + agent instructions
+├── docs/                        # This documentation set
+├── airport_people_counter/
+│   ├── app/                     # Runtime: detect_people, queue_prototype,
+│   │                            #   mapping, sort_tracker, snapshot*, api_*, ml/
+│   ├── config/camera.yaml       # Behaviour thresholds + legacy geometry
+│   ├── config/mappings.yaml     # Per-camera mapping geometry (editor-written)
+│   ├── tests/                   # unittest + pytest suites
+│   ├── ml/ scripts/             # Dataset, training, evaluation tooling
+│   ├── datasets/                # Dataset versions, manifests, SQLite catalog
+│   ├── models/                  # yolov5s.pt, YuNet onnx
+│   ├── yolov5/                  # Vendored YOLOv5 repo
+│   ├── requirements/, Makefile, run.sh
+└── Queue-monitoring-dashboard/  # React 19 + Vite 8 + Tailwind v4
+    ├── src/App.tsx              # Layout, LIVE/DEMO switching
+    ├── src/components/          # sections, charts, health, MappingEditor
+    ├── src/lib/                 # api.ts, telemetry.ts, mapping.ts (+tests)
+    ├── vite.config.ts, package.json, vitest.config.ts
+    └── AGENTS.md                # Figma-scaffold-specific agent notes
 ```
 
-## Authoritative Files by Subsystem
+### Authoritative files by subsystem
 
-| Subsystem | Authoritative Files |
-|-----------|---------------------|
-| Camera capture | `app/detect_people.py` (FrameStream class) |
-| YOLO detection | `app/detect_people.py` (load_model, infer) |
-| SORT tracking | `app/sort_tracker.py` (SortTracker) |
-| Queue analytics | `app/queue_prototype.py` (QueueAnalytics, RuleClassifier) |
-| ROI/Line config | `config/camera.yaml` + `app/queue_prototype.py` (CameraConfig) |
-| Classification | `app/queue_prototype.py` (RuleClassifier) |
-| HUD/Dashboard rendering | `app/queue_prototype.py` (draw_dashboard, draw_overlay) |
-| Snapshot/API serialization | `app/snapshot.py` (SnapshotBuilder) |
-| Thread-safe sharing | `app/snapshot_holder.py` (SnapshotHolder) |
-| FastAPI endpoints | `app/api_server.py` |
-| API contracts | `app/api_models.py` |
-| Dashboard telemetry | `src/lib/telemetry.ts` (useRealTelemetry) |
-| Dashboard API client | `src/lib/api.ts` |
-| CameraPanel (MJPEG + overlays) | `src/components/sections.tsx` |
-| Vite proxy config | `vite.config.ts` |
-
----
+| Subsystem | File(s) |
+|-----------|---------|
+| Capture, inference, main loop, CLI | `app/detect_people.py` |
+| Tracking | `app/sort_tracker.py` |
+| Analytics, classifier, crossings, legacy config | `app/queue_prototype.py` |
+| Mapping schema/validation/persistence | `app/mapping.py` |
+| Snapshot serialization | `app/snapshot.py` |
+| Shared state HTTP side | `app/api_server.py`, `app/api_models.py`, `app/dashboard_models.py` |
+| Frontend API contract | `src/lib/api.ts` |
+| Frontend data hooks (live + simulator) | `src/lib/telemetry.ts` |
+| Geometry transforms (editor) | `src/lib/mapping.ts` |
+| Dashboard panels | `src/components/sections.tsx` |
 
 ## Testing
 
-### Run All Tests
 ```bash
 cd airport_people_counter
 
-# Via launcher (auto venv)
-make test
+make test                 # unittest discover — 265 tests (2026-10-22)
+venv/bin/python -m pytest tests -q      # pytest — 310 tests (2026-10-22)
 
-# Direct (venv must be active)
-venv/bin/python -m unittest discover -s tests
-
-# With pytest
-venv/bin/python -m pytest tests -q
-```
-
-### Targeted Test Suites
-```bash
-# Camera-only analytics (synthetic tracks, no camera/YOLO)
+# Targeted
 venv/bin/python -m unittest tests.test_queue_prototype -v
+venv/bin/python -m unittest tests.test_mapping -v
+venv/bin/python -m pytest tests/test_mapping_api.py -q
 
-# Offline evaluator tests
-venv/bin/python -m unittest discover -s tests -p "test_evaluate_counts.py"
-
-# Legacy core/ engine tests (only relevant for --monitor)
-venv/bin/python -m unittest tests.test_backlog_alerts -v
-venv/bin/python -m unittest tests.test_fusion -v
-venv/bin/python -m unittest tests.test_metrics -v
-venv/bin/python -m unittest tests.test_monitor -v
-venv/bin/python -m unittest tests.test_state_machine -v
-```
-
-### Smoke Test
-```bash
-# Quick offline test on sample image (no camera needed)
+# Smoke (offline single image; prints PERSONS: N, mapping INFO)
 make smoke
-# Runs: venv/bin/python app/detect_people.py --source output/smoke_test/bus.jpg
 ```
 
-**Expected:** Processes image once, prints `PERSONS: N STATE: UNCONFIGURED (image mode — no FPS)`, exits cleanly.
-
----
-
-## Debugging Workflow
-
-### Backend Debugging
-
-#### 1. Enable Debug HUD
-```bash
-./run.sh --api --debug
-```
-Shows classifier `reasons[]` directly on OpenCV window.
-
-#### 2. Print Console Metrics
-The console line prints every frame:
-```
-DET: 3 IN-QUEUE: 2 ENTR: 5 EXIT: 3 FPS: 22.1 inf: 34.2ms trk: 0.1ms disp: 3.1ms STATE: NORMAL MOV: MOVING REASONS: queue_occupancy_above_normal_threshold
-```
-
-#### 3. Test Camera Without YOLO
-```bash
-./run.sh --test-camera 0
-# Measures FPS, verifies frames changing, no YOLO loaded
-```
-
-#### 4. List Cameras
-```bash
-./run.sh --list-cameras
-# Shows index, resolution, reported/measured FPS, macOS device name
-```
-
-#### 5. Preview ROI Layout
-```bash
-./run.sh --roi-preview
-# Shows saved ROI + counting line on live frame
-```
-
-#### 6. Inspect API Endpoints
-```bash
-# Health
-curl http://localhost:8080/api/health
-
-# Snapshot
-curl http://localhost:8080/api/snapshot | python -m json.tool
-
-# Config
-curl http://localhost:8080/api/config
-
-# Events
-curl http://localhost:8080/api/events
-```
-
-#### 7. Test MJPEG Stream
-```bash
-# Quick test (5 seconds)
-curl -N --max-time 5 http://localhost:8080/api/camera/stream | head -5
-# Should output MJPEG boundary + JPEG data
-```
-
-### Frontend Debugging
-
-#### 1. Dev Server
 ```bash
 cd Queue-monitoring-dashboard
-npm run dev
-# http://localhost:8443 — hot reload enabled
+pnpm test                 # vitest — 30 tests (2026-10-21)
+npx tsc --noEmit          # type check
+pnpm run build            # production build (must stay green)
 ```
 
-#### 2. Browser DevTools
-- **Network tab:** Verify `/api/snapshot` polls (1 Hz), `/api/camera/stream` (MJPEG)
-- **Console:** React errors, API fetch errors
-- **React DevTools:** Component tree, props, state
+Test counts drift as tests are added — treat the commands as the contract and
+the numbers as “as of” markers.
 
-#### 3. Source Selector
-Top bar dropdown: **"Simulator"** (synthetic data) vs **"Live API"** (real backend)
+## Validation & Evaluation
 
-#### 4. Diagnostics Drawer
-Click operator health chip (top right) → shows scenario selector, raw snapshot JSON
+### Automated layers
+1. **Unit tests** — synthetic tracks, no camera/YOLO needed (fast, deterministic).
+2. **Smoke** — real model loads and processes a fixture image.
+3. **Type/build** — `tsc --noEmit` + `pnpm run build`.
 
-#### 5. Build Verification
+### Manual smoke (with camera or video)
+| Check | Expected |
+|-------|----------|
+| `● LIVE` indicator increments | frames arriving |
+| YOLO boxes + stable SORT IDs | detection + tracking |
+| ROI / lines in dashboard | geometry visible; “Edit mapping” opens |
+| ENTER/EXIT events on crossing | counting works |
+| Occupancy = in-queue / capacity | `IN-QUEUE` matches visible count |
+| State ladder | EMPTY → … → CONGESTED per config |
+| `--record` JSONL | valid JSON per line |
+
+### Controlled scenario table (default `camera.yaml`, cap = 30)
+
+Occupancy thresholds are ratios of `queue_capacity` — expected counts derived
+from them: SPARSE ≥ 10% (≥3 people), NORMAL ≥ 40% (≥12), CROWDED ≥ 60% (≥18),
+CONGESTED ≥ 80% (≥24 **and** mean spacing ≤ 60 px). BACKLOG requires a
+configured flow baseline (disabled by default).
+
+### API → dashboard sync
 ```bash
-npm run build
-# Production build to dist/ — verifies TypeScript compiles
+curl -s localhost:8080/api/dashboard/health
+curl -s localhost:8080/api/dashboard/snapshot
+curl -N --max-time 3 localhost:8080/api/camera/stream | wc -c            # bytes flow
+curl -N --max-time 3 "localhost:8080/api/camera/stream?annotated=0" | wc -c
 ```
+Dashboard must show matching numbers (queue, occupancy, ENTR/EXIT) and zero
+console errors (favicon 404 is acceptable).
 
----
-
-## Adding New Features
-
-### Backend: New Analytics Metric
-1. Add field to `QueueMetrics` in `queue_prototype.py`
-2. Compute in `QueueAnalytics.update()`
-3. Add to `build_dashboard_model()` in `queue_prototype.py`
-4. Add to `QueueSnapshot` in `snapshot.py`
-5. Add to Pydantic model in `api_models.py`
-6. Update `SnapshotBuilder._tracks_to_api()` / `_events_to_api()` if needed
-7. Run tests: `make test`
-
-### Backend: New API Endpoint
-1. Add Pydantic model to `api_models.py`
-2. Add endpoint to `api_server.py`
-3. Update CORS if new origin needed
-4. Test: `curl http://localhost:8080/api/new-endpoint`
-
-### Frontend: New Dashboard Panel
-1. Create component in `src/components/sections.tsx`
-2. Import and compose in `App.tsx`
-3. Ensure it only reads from `Snapshot` prop (no business logic)
-4. Use `lib/ui.ts` formatters/colors for consistency
-
-### Frontend: New API Call
-1. Add TypeScript interface to `lib/api.ts`
-2. Add fetch function to `lib/api.ts`
-3. Use in component via `useEffect` or custom hook
-
----
-
-## Regression Testing Checklist
-
-Before committing changes affecting queue counting:
-
-### Automated
-- [ ] `make test` — all 137 tests pass
-- [ ] `make smoke` — offline image test passes
-
-### Manual (with real camera or video)
-- [ ] Camera opens, delivers frames (`● LIVE` indicator increments)
-- [ ] YOLO detects people (boxes appear on OpenCV window / dashboard)
-- [ ] SORT assigns stable IDs (same person keeps same ID across frames)
-- [ ] ROI works: people outside ROI are greyed out, not counted
-- [ ] Counting line works: ENTER/EXIT events fire correctly
-- [ ] Occupancy % = people_in_queue / queue_capacity
-- [ ] Flow rates: ENTER/EXIT per minute update
-- [ ] State classification: EMPTY → SPARSE → NORMAL → CROWDED → CONGESTED
-- [ ] Congestion stopwatch: starts on CONGESTED, stops on exit
-- [ ] Events logged: `--record output/events.jsonl` produces valid JSONL
-- [ ] API `/api/snapshot` returns valid JSON matching Pydantic schema
-- [ ] API `/api/camera/stream` serves MJPEG (browser `<img>` loads)
-- [ ] Dashboard "Live API" mode shows MJPEG + overlays
-- [ ] Dashboard "Simulator" mode shows synthetic data
-- [ ] Source selector switches cleanly between Simulator/API
-
----
-
-## Common Development Tasks
-
-### Update Dependencies
-
-**Backend:**
+### Offline evaluation against ground truth
 ```bash
-cd airport_people_counter
-venv/bin/pip install --upgrade -r requirements/requirements.txt
-# Update requirements.txt with new versions
-venv/bin/pip freeze | grep -E "torch|numpy|opencv|fastapi|uvicorn|pydantic" > requirements/requirements.txt
+./run.sh --source input/airport_cctv.mp4 --record-samples output/samples.jsonl
+# ground truth CSV: start_s,end_s,count[,note]
+venv/bin/python scripts/evaluate_counts.py \
+    --samples output/samples.jsonl --ground-truth output/ground_truth.csv \
+    --tolerance-s 1.0 --gap-s 10.0 --min-coverage 0.8 --json output/eval_report.json
 ```
+Report: MAE, ±1/±2 accuracy, bias, coverage; exit codes 0 success / 1
+insufficient data / 2 malformed input.
 
-**Frontend:**
+**Accuracy gates (defined; never yet passed on real footage):** ≥30 min
+representative footage, ≥50 intervals, MAE < 1.0, ±1 > 85%, ±2 > 95%,
+|bias| < 0.5, coverage ≥ 80%. Never claim “deployment-grade accuracy”
+without these.
+
+### Regression checklist (before commit)
+- [ ] `make test`, `pytest`, `pnpm test` all green
+- [ ] `tsc --noEmit` + `pnpm run build` green
+- [ ] Counting-affecting change → manual camera/video pass above
+- [ ] API change → curl checks + dashboard sync
+- [ ] Config/API/docs updated in the same commit
+- [ ] `git diff` reviewed — no unrelated files included
+
+## Debugging
+
 ```bash
-cd Queue-monitoring-dashboard
-npm update
-npm audit fix
+./run.sh --api --debug        # classifier reasons on the HUD
+./run.sh --test-camera 0      # FPS without YOLO
+./run.sh --roi-preview        # saved legacy geometry on live frame
+curl -s localhost:8080/api/dashboard/health | python3 -m json.tool
 ```
-
-### Add Python Type Hints
-- Use `from __future__ import annotations`
-- Prefer `Literal` for enums, `Optional` for nullable
-- Run `venv/bin/python -m mypy app/` if mypy configured
-
-### Profile Performance
-```bash
-# Per-component timings printed every 10 frames in console
-# End-of-run summary:
-# FPS       : 23.6
-# Inference : 34.0 ms/frame
-# Tracking  : 0.1  ms/frame
-# Analytics : 0.1  ms/frame
-# Display   : 3.2  ms/frame
-# Capture   : 30.0 FPS from source
-```
-
-### Modify Classifier Thresholds
-Edit `config/camera.yaml`:
-```yaml
-classifier:
-  occupancy_sparse: 0.10
-  occupancy_normal: 0.40
-  occupancy_crowded: 0.60
-  occupancy_congested: 0.80
-  hysteresis: 0.05
-  debounce_frames: 5
-  congested_max_spacing_px: 60
-  congested_require_spacing: true
-```
-> Thresholds are EXAMPLE VALUES — must be calibrated against real CCTV footage.
-
----
-
-## Code Style & Conventions
-
-### Python
-- Type hints on all public functions
-- `Literal` for enum-like strings
-- Dataclasses for immutable data
-- `frozen=True` for snapshot objects
-- No global mutable state (except `SnapshotHolder` singleton)
-
-### TypeScript/React
-- Interfaces for all API responses
-- Custom hooks for data fetching (`useRealTelemetry`)
-- Components receive `Snapshot` prop — no business logic inside
-- Tailwind utility classes, no custom CSS
-- Double quotes for strings with apostrophes
-
-### Git Commits
-- Update documentation in same commit as code changes
-- Run `make test` before commit
-- Update `README.md` "Last reviewed against code" date
-
----
-
-## Debugging Checklist for Common Issues
+Per-frame console line: `DET / IN-QUEUE / ENTR / EXIT / FPS / inf / trk / disp /
+STATE / MOV / REASONS`; end-of-run prints measured per-component timings.
 
 | Symptom | Check |
 |---------|-------|
-| No camera frames | macOS permission, `--list-cameras`, another app using camera |
-| Low FPS | `--imgsz`, `display_scale`, `--fps`, camera hardware limit |
-| No detections | Model path, confidence threshold, `--device`, class filter (COCO 0) |
-| Tracks not stable | `max_age`, `min_hits`, `iou_threshold` in SortTracker |
-| ROI not counting | `config/camera.yaml` roi_configured, polygon area > 0 |
-| Line not counting | `counting_line` configured, `xray_side_point` set |
+| No camera frames | macOS permission, `--list-cameras`, camera busy; launcher shows `NO SIGNAL` |
+| Low FPS | `--imgsz`, `--fps`, `camera.display_scale`, camera’s real output rate |
+| No detections | model path, `--conf`, `--device`, person class only |
+| Tracks unstable | `max_age`, `min_hits`, `iou_threshold` in SortTracker |
+| ROI/line not counting | mapping active? (`GET /api/dashboard/mapping`), else legacy `camera.yaml` geometry; mapping wins and is never combined with legacy |
+| Spurious/reversed counts | `crossing_debounce_frames`, line direction in the editor (Enter swaps) |
 | State stuck | `hysteresis`, `debounce_frames`, `congested_require_spacing` |
-| API 404 | Vite proxy running, backend on 8080, CORS origins |
-| MJPEG not loading | `/api/camera/stream` endpoint, holder has frame, CORS |
-| Dashboard shows "OFFLINE" | Backend running with `--api`, source selector = "Live API" |
+| `BACKLOG` never fires | `baseline_people_per_minute` is `null` by design |
+| API 502 from dashboard | backend not running / wrong `API_PROXY_TARGET` |
+| MJPEG empty | holder has no frame (video/camera source required; image mode is single-shot) |
+| Dashboard OFFLINE | run with `--api`, source selector = LIVE |
+
+## Common Tasks
+
+**New analytics metric:** field in `queue_prototype` → compute in
+`QueueAnalytics.update()` → `build_dashboard_model()` → `snapshot.py` →
+Pydantic (`api_models`/`dashboard_models`) → frontend `api.ts` type → panel →
+tests (`make test`).
+
+**New API endpoint:** model in the right `*_models.py` → route in
+`api_server.py` → docs/API.md → curl test (+ pytest if logic-bearing).
+
+**New dashboard panel:** component in `sections.tsx` → compose in `App.tsx` →
+reads the `Snapshot` prop only (no business logic) → `lib/ui.tsx` styles.
+
+**Frontend API call:** interface + fetch function in `src/lib/api.ts` → hook in
+`telemetry.ts` → component.
+
+## Code Style & Conventions
+
+**Python:** type hints on public functions; `Literal` for enum strings;
+frozen dataclasses for snapshots; no global mutable state except the
+`SnapshotHolder` singleton; validate before persisting.
+
+**TypeScript/React:** interfaces for every API response; hooks for fetching;
+components are presentation-only; Tailwind utilities (no custom CSS unless in
+`index.css`); double quotes in JSX strings containing apostrophes.
+
+**Git:** docs updated in the same commit as code; run the test suites before
+committing; keep user work uncommitted untouched (don’t sweep unrelated files
+into a feature commit).

@@ -98,4 +98,4 @@ data, and it refuses to write inside `datasets/`):
 venv/bin/python scripts/make_synthetic_fixture.py --out /tmp/ml-fixture --images 24 --seed 7
 ```
 
-Full documentation: [../docs/DATASETS.md](../docs/DATASETS.md)
+Full documentation: [../../docs/DATASETS.md](../../docs/DATASETS.md)

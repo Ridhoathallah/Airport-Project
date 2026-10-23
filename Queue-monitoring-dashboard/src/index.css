@@ -210,6 +210,28 @@ body {
   flex-shrink: 0;
 }
 
+/* A hairline used to separate rows inside a panel. */
+.rule {
+  height: 1px;
+  background: var(--border-primary);
+}
+
+/*
+  The same hairline colour as a background.
+
+  The Astra kit ships `--border-primary` as a token but no utility that
+  paints it, so a 1px separator that is not itself a border (a vertical
+  divider, a 1px grid gap) had no colour at all and rendered as a gap.
+*/
+.bg-rule {
+  background-color: var(--border-primary);
+}
+
+/* The outline colour of a control, outside the .ctl component. */
+.border-control {
+  border-color: var(--border-control);
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
    Controls
    ───────────────────────────────────────────────────────────────────────── */
@@ -311,4 +333,14 @@ body {
 
 .live-dot {
   animation: live-dot 2s ease-in-out infinite;
+}
+
+/* A value that just changed. One short pulse, no looping motion. */
+@keyframes value-flash {
+  0% {
+    background-color: color-mix(in srgb, var(--st-info) 22%, transparent);
+  }
+  100% {
+    background-color: transparent;
+  }
 }

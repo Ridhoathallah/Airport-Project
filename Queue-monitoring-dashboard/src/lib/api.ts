@@ -41,6 +41,10 @@ export interface QueueTelemetry {
   reason: string;
   /** Operational guidance for the current condition. */
   action?: string;
+  predicted_wait?: number;
+  clearance_time?: number;
+  service_time_s?: number;
+  pacing_status?: "OPTIMAL" | "STEADY" | "SLOW_INSPECTION" | "STAGNANT" | "IDLE";
 }
 
 export interface SystemTelemetry {
@@ -66,6 +70,12 @@ export interface CameraTelemetry {
   packet_loss: number | null;
   last_frame_age_ms: number;
   uptime_sec: number;
+  /** Camera chrome label reported by the pipeline, e.g. "CAM-01". */
+  source_label: string;
+  /** Live webcam index; null for file/IP/image sources. */
+  source_index: number | null;
+  /** Clockwise rotation applied at the capture edge (degrees). */
+  rotation_deg: number;
 }
 
 export interface RecordingTelemetry {
@@ -118,6 +128,10 @@ export interface ConfigResponse {
   source_shape_h?: number;
   mapping_active?: boolean;
   reference_point?: string;
+  /** Clockwise capture rotation persisted in camera.yaml. */
+  rotation?: number;
+  /** Persisted camera.yaml source when numeric. */
+  source_index?: number;
 }
 
 // ===== Interactive camera mapping (config/mappings.yaml) =====
@@ -212,6 +226,53 @@ export interface MappingPayload {
   lines: Array<{ id: "in" | "out"; points: number[][]; direction: "IN" | "OUT" }>;
   reference_point: "bottom_center" | "centroid";
   source_shape?: { width: number; height: number };
+}
+
+// ===== Camera source selection / image rotation =====
+
+export interface CameraSourceInfo {
+  index: number;
+  available: boolean;
+  /** True when this webcam is the one currently feeding the pipeline. */
+  running: boolean;
+}
+
+export interface CameraSourcesResponse {
+  sources: CameraSourceInfo[];
+  /** Persisted camera.yaml source; null when unset or non-numeric. */
+  current: number | null;
+}
+
+export interface CameraControlResult {
+  applied: boolean;
+  camera_id: string;
+  source_index: number | null;
+  rotation_deg: number;
+  errors: string[];
+}
+
+export async function getCameraSources(): Promise<CameraSourcesResponse> {
+  return fetchJson<CameraSourcesResponse>("/dashboard/camera/sources");
+}
+
+export async function selectCameraSource(index: number): Promise<CameraControlResult> {
+  return postJson<CameraControlResult>("/dashboard/camera/select", { index });
+}
+
+export async function setCameraRotation(degrees: number): Promise<CameraControlResult> {
+  return postJson<CameraControlResult>("/dashboard/camera/rotation", { degrees });
+}
+
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new Error(`API error ${res.status}: ${res.statusText}`);
+  }
+  return res.json();
 }
 
 export function isOnline(snapshot: SnapshotResponse | null): boolean {

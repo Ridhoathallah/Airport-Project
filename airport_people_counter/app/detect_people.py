@@ -15,10 +15,6 @@
   Analytics layer: app/queue_prototype.py (occupancy, line crossings,
   flow, waiting, spacing, density, classifier, stopwatch, overlay).
 
-  The queue-monitor engine (Sensor 1 / SENSOR_01 / XRAY01 / people-m²)
-  is a SEPARATE legacy feature, disabled by default. Enable it only for
-  the future sensor-fusion phase with --monitor.
-
   Usage:
     # Webcam (default: camera.source from config/camera.yaml, else index 0):
     python app/detect_people.py
@@ -51,6 +47,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from typing import Optional
 
 try:
     import cv2
@@ -66,6 +63,8 @@ except ModuleNotFoundError as e:
     sys.exit(1)
 
 from sort_tracker import SortTracker
+from camera_control import consume_camera_control
+from orientation import rotate_frame, normalize_rotation, rotated_size
 from queue_prototype import (
     BACKLOG_UNAVAILABLE_MSG,
     QueueAnalytics,
@@ -86,22 +85,6 @@ from snapshot_holder import get_holder
 from reload_signal import consume_config_reload
 from shutdown import shutdown_requested
 
-# ─────────────────────────────────────────────────────────────
-#  LEGACY QUEUE-MONITOR ENGINE  (opt-in with --monitor)
-# ─────────────────────────────────────────────────────────────
-# The camera prototype is the default path. The core/ queue-monitoring
-# engine (Sensor 1 emission, SENSOR_01, XRAY01, people/m²) is a separate
-# future-phase feature and only activates when --monitor is passed.
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-try:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-    from core.models import SensorHealth, SensorReading, utc_now_iso
-    from core.monitor import QueueMonitor
-    _CORE_AVAILABLE = True
-except Exception:
-    QueueMonitor = SensorReading = None
-    SensorHealth = utc_now_iso = None
-    _CORE_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIGURATION  (edit here — not scattered in the code)
@@ -183,13 +166,6 @@ WINDOW_NAME = "Airport X-Ray Queue — Camera-Only Prototype"
 # Live view is shown at this width (0 = native camera resolution). A
 # slightly smaller window keeps the GUI fast enough to hold 24 FPS.
 DISPLAY_WIDTH = 960
-
-# Legacy queue-monitor engine (Sensor 1 / SENSOR_01 / XRAY01 / people-m²):
-# DISABLED by default in the camera-only phase. Opt in with --monitor.
-MONITOR_ENABLED = False
-SENSOR_ID       = "SENSOR_01"   # must match config/default.yaml → sensors.s1.id
-SENSOR_TYPE     = "vision"      # must match config/default.yaml → sensors.s1.type
-ZONE_AREA_M2    = 50.0          # fallback monitored area if config is unavailable
 
 # Show the raw people/px² value on the panel (clearly labelled uncalibrated).
 SHOW_RAW_DENSITY = False
@@ -428,6 +404,30 @@ def refine_head_boxes(frame, face_detector, head_array):
     return refined
 
 
+def _camera_event(event_type, label, detail=None, severity="info"):
+    """Operator-log event dict for camera source/rotation changes."""
+    return {
+        "event_type": event_type,
+        "event_time": iso_from_unix(time.time()),
+        "label": label,
+        "detail": detail,
+        "severity": severity,
+    }
+
+
+def _display_dims(camera_config, cam_w, cam_h):
+    """(disp_w, disp_h, coord_scale) from the configured display scale.
+
+    Mirrors the initial startup computation so a hot camera switch or
+    rotation keeps the standalone-GUI render sizing consistent.
+    """
+    scale = camera_config.display_scale if camera_config.display_scale > 0 else 1.0
+    disp_w = max(160, int(cam_w * scale))
+    disp_h = max(120, int(cam_h * scale))
+    coord_scale = (disp_w / cam_w) if cam_w > 0 else 1.0
+    return disp_w, disp_h, coord_scale
+
+
 class FrameStream:
     """
     Background video source that always hands out the latest frame.
@@ -438,9 +438,14 @@ class FrameStream:
     tagged with a generation number so callers can skip stale frames.
     """
 
-    def __init__(self, source, width=0, height=0):
+    def __init__(self, source, width=0, height=0, rotation=0):
         src = int(source) if str(source).isdigit() else source
         self._source = str(source)
+        # Clockwise rotation applied to every frame after capture (0/90/
+        # 180/270). Applied in the reader thread before the frame becomes
+        # visible, so everything downstream — detection, drawing, mapping
+        # pixels, MJPEG — sees the rotated frame consistently.
+        self._rotation = normalize_rotation(rotation)
         self._cap = cv2.VideoCapture(src)
         if not self._cap.isOpened():
             raise ValueError(f"Could not open source: {source}")
@@ -455,8 +460,12 @@ class FrameStream:
                 self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             if height > 0:
                 self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        if not self._is_file:
-            self._cap.set(cv2.CAP_PROP_FPS, CAPTURE_FPS)
+        # NOTE: no `cap.set(CAP_PROP_FPS, …)` here. Requesting a frame
+        # rate from AVFoundation can wedge the macOS camera daemon after
+        # repeated open/close cycles — the device then delivers no frames
+        # at all (observed 2026-10-22). Delivery is paced in software
+        # anyway (_read_loop throttles live sources to 1/CAPTURE_FPS), so
+        # the device-side request was redundant.
         self._file_fps = self._cap.get(cv2.CAP_PROP_FPS)
 
         # FPS the capture device reports after the request (live sources
@@ -484,6 +493,11 @@ class FrameStream:
         self._gen = 0
         self._ended = False
         self._running = False
+        # Delivered frame size *before* rotation (the device's native
+        # shape). Needed so a mid-stream rotation change can recompute
+        # the final frame size exactly; None until first delivery.
+        self._native_w: Optional[int] = None
+        self._native_h: Optional[int] = None
         # Actual capture resolution, updated from the first delivered frame.
         self.frame_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
         self.frame_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
@@ -537,8 +551,14 @@ class FrameStream:
                 with self._lock:
                     self._ended = True
                 break
+            if self._rotation:
+                if self._native_w is None:
+                    self._native_w, self._native_h = frame.shape[1], frame.shape[0]
+                frame = rotate_frame(frame, self._rotation)
             with self._lock:
-                if not self.frame_w:
+                # Rotation swaps the frame dimensions; keep the reported
+                # resolution equal to the frame actually being delivered.
+                if self._rotation or not self.frame_w:
                     self.frame_w, self.frame_h = frame.shape[1], frame.shape[0]
                 self._frame = frame
                 self._gen += 1
@@ -572,6 +592,37 @@ class FrameStream:
             return self._frame, self._gen
 
     @property
+    def rotation(self) -> int:
+        """Clockwise rotation currently applied at the capture edge."""
+        return self._rotation
+
+    @property
+    def native_w(self) -> Optional[int]:
+        """Delivered frame width before rotation (None until known)."""
+        return self._native_w
+
+    @property
+    def native_h(self) -> Optional[int]:
+        """Delivered frame height before rotation (None until known)."""
+        return self._native_h
+
+    def set_rotation(self, degrees: int) -> None:
+        """Change the applied rotation mid-stream (rotation-only switch).
+
+        Frames rotated by the reader loop on the next read; the reported
+        frame size follows the next delivered frame. Clearing the
+        rotation restores the device-reported size.
+        """
+        degrees = normalize_rotation(degrees)
+        if degrees == self._rotation:
+            return
+        with self._lock:
+            self._rotation = degrees
+            if not degrees:
+                self.frame_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or self.frame_w
+                self.frame_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or self.frame_h
+
+    @property
     def last_frame_unix(self) -> float:
         """Epoch seconds of the most recently delivered frame (0 = none yet).
 
@@ -588,14 +639,17 @@ class FrameStream:
         self._cap.release()
 
 
-def open_source(source, width=0, height=0):
+def open_source(source, width=0, height=0, rotation=0):
     """
     Open an input source: webcam index, video/image file, or a
     smartphone IP-camera stream URL (http/rtsp).
 
     ``width``/``height`` request a capture resolution (webcam only; the
     camera falls back to its nearest supported size, which is reported
-    via ``FrameStream.frame_w/frame_h``).
+    via ``FrameStream.frame_w/frame_h``). ``rotation`` is the clockwise
+    frame rotation applied at the capture edge (0/90/180/270; see
+    app/orientation.py) — the rotated frame is the frame detection,
+    overlays and streams all see.
 
     Returns (is_image, image, stream).
     """
@@ -608,11 +662,15 @@ def open_source(source, width=0, height=0):
         image = cv2.imread(str(source_path))
         if image is None:
             raise ValueError(f"Could not read image: {source_path}")
-        print(f"[INFO] Input source : IMAGE — {source_path.name}")
+        rot = normalize_rotation(rotation)
+        if rot:
+            image = rotate_frame(image, rot)
+        print(f"[INFO] Input source : IMAGE — {source_path.name}"
+              + (f" (rotated {rot}°)" if rot else ""))
         return True, image, None
 
     try:
-        stream = FrameStream(source, width=width, height=height)
+        stream = FrameStream(source, width=width, height=height, rotation=rotation)
     except ValueError as exc:
         raise ValueError(
             f"{exc}\n"
@@ -744,14 +802,11 @@ def match_track_confs(tracks, det_array):
     return confs
 
 
-def run_detection(source=0, camera_config=None, monitor=None, detect_mode=None,
-                  sensor_id=SENSOR_ID, sensor_type=SENSOR_TYPE, record_path=None,
+def run_detection(source=0, camera_config=None, detect_mode=None,
+                  record_path=None,
                   debug=False, legacy_hud=False, samples_path=None, api_enabled=False,
                   headless=False):
     """Main camera-only prototype loop.
-
-    ``monitor`` is the LEGACY ``core.monitor.QueueMonitor`` (opt-in via
-    --monitor). The default path never emits SensorReading / people-m².
 
     ``detect_mode`` overrides ``camera.detect_mode`` from camera.yaml:
     "person" (full body boxes, default) or "head" (head-crop tracking).
@@ -772,19 +827,18 @@ def run_detection(source=0, camera_config=None, monitor=None, detect_mode=None,
     if detect_mode:
         camera_config.detect_mode = detect_mode.lower()
 
-    is_image, image, stream = open_source(source, camera_config.width, camera_config.height)
+    is_image, image, stream = open_source(
+        source, camera_config.width, camera_config.height, rotation=camera_config.rotation
+    )
 
     if str(source).isdigit():
-        source_label = "WEBCAM"
+        # Operator-facing chrome label: webcam index N → CAM-0(N+1).
+        source_label = f"CAM-{int(str(source)) + 1:02d}"
     elif str(source).startswith(("http://", "https://", "rtsp://")):
         source_label = "IP-CAM"
     else:
         source_label = str(Path(str(source)).name) or "VIDEO"
-
-    if monitor is not None and _CORE_AVAILABLE:
-        area = monitor.settings.zone.area_m2
-        print(f"[INFO] (legacy) Queue-monitor engine active — sensor {sensor_id} → zone {monitor.settings.zone_id}")
-        print(f"[INFO] (legacy) Monitored area {area:.1f} m² — density from tracked head count")
+    source_index = int(str(source)) if str(source).isdigit() else None
 
     # Actual capture resolution (native for the webcam, or the nearest
     # supported size when a specific resolution was requested).
@@ -866,6 +920,11 @@ def run_detection(source=0, camera_config=None, monitor=None, detect_mode=None,
     frame_count  = 0
     fps_interval = 10
     t_start      = time.time()
+
+    # A redirected stdout is a log, not a terminal: the per-frame live
+    # line is throttled there so the log stays readable and bounded.
+    stdout_is_tty = sys.stdout.isatty()
+    last_console_log = 0.0
 
     # Windowed per-component averages (ms/frame): inference, display/render,
     # and capture interval (from FrameStream.delivered_fps). Measured values.
@@ -998,28 +1057,6 @@ def run_detection(source=0, camera_config=None, monitor=None, detect_mode=None,
             recorder.maybe_write(snap, source_frame=gen,
                                  source_fps=stream.reported_fps or None)
 
-        # ── LEGACY queue-monitor engine (opt-in --monitor) ──
-        if monitor is not None and _CORE_AVAILABLE:
-            ts = utc_now_iso()
-            area = monitor.settings.zone.area_m2
-            density_now = (len(tracks) / area) if area > 0 else 0.0
-            monitor.ingest_sensor(SensorReading(
-                sensor_id=sensor_id,
-                sensor_type=sensor_type,
-                event_time=ts,
-                server_received_time=ts,
-                people_count=len(tracks),
-                density=density_now,
-                average_distance=0.0,
-                flow_rate=0.0,
-                confidence=1.0,
-                health=SensorHealth.ONLINE,
-            ))
-            zone = monitor.snapshot()
-            zone_state = zone.state.value
-        else:
-            zone_state = "-"
-
         if frame_count % fps_interval == 0:
             elapsed = time.time() - t_start
             fps = frame_count / elapsed if elapsed > 0 else 0.0
@@ -1039,6 +1076,10 @@ def run_detection(source=0, camera_config=None, monitor=None, detect_mode=None,
             frame_count=frame_count, detections=len(det_array), tracks=len(tracks),
             source=source_label, device=DEVICE, img_size=IMG_SIZE,
             last_frame_unix=stream.last_frame_unix,
+            source_index=source_index,
+            source_label=source_label,
+            rotation_deg=camera_config.rotation,
+            frame_w=frame.shape[1], frame_h=frame.shape[0],
         )
         dash = build_dashboard_model(snap, system, camera_config, recent_events)
         series.append(frame_count, dash.queue)
@@ -1108,15 +1149,24 @@ def run_detection(source=0, camera_config=None, monitor=None, detect_mode=None,
         q = dash.queue
         cap_txt = f" cap: {cap_ms:5.1f}ms" if cap_ms > 0 else ""
         cong_txt = f" cong: {fmt_duration(q.congestion_duration_s)}" if q.congestion_active else ""
-        print(
-            f"\rDET: {q.people_detected:<3} IN-QUEUE: {q.people_in_queue:<3} "
+        console_line = (
+            f"DET: {q.people_detected:<3} IN-QUEUE: {q.people_in_queue:<3} "
             f"ENTR: {q.total_entries:<3} EXIT: {q.total_exits:<3} "
             f"FPS: {fps:5.1f} inf: {inf_ms:5.1f}ms trk: {trk_ms:4.1f}ms "
             f"disp: {disp_ms:5.1f}ms{cap_txt} "
             f"STATE: {q.state:<11} MOV: {q.movement:<6}{cong_txt} "
-            f"REASONS: {','.join(q.reasons)}",
-            end="", flush=True,
+            f"REASONS: {','.join(q.reasons)}"
         )
+        # The live console line is a terminal feature. When stdout is
+        # redirected to a file (the headless launcher does that) the
+        # carriage-return line is rewritten once per frame, which grows the
+        # log by megabytes per minute. There the line is printed at most
+        # once per second, and with a real newline.
+        if stdout_is_tty:
+            print(f"\r{console_line}", end="", flush=True)
+        elif time.time() - last_console_log >= 1.0:
+            print(console_line, flush=True)
+            last_console_log = time.time()
 
         # Hot-reload requested by the API (e.g. PUT /api/dashboard/mapping).
         # Same path as the 'r' key below; the per-track crossing state is
@@ -1133,6 +1183,84 @@ def run_detection(source=0, camera_config=None, monitor=None, detect_mode=None,
                 f"mapping active: {camera_config.mapping_active}, "
                 f"ref: {getattr(getattr(camera_config, 'mapping', None), 'reference_point', 'n/a')}"
             )
+
+        # Camera control (source switch / rotation) requested via the API
+        # (POST /api/dashboard/camera/*). Mirrors the reload path: the
+        # endpoints validate and persist first, so a failed update never
+        # reaches this point. Rotation is one lane-level setting: it stays
+        # in effect across a source switch and can be re-set afterwards.
+        action, payload, ctl_src = consume_camera_control()
+        if action == "switch":
+            camera_config = load_camera_config(camera_config.path or DEFAULT_CAMERA_CONFIG_PATH)
+            target = str(payload.get("source", ""))
+            if not target:
+                print("[WARN] Camera switch request without a source — ignored.")
+            elif str(source) == target:
+                print(f"\n[INFO] Camera switch ignored — already on source {target}.")
+            else:
+                try:
+                    new_stream = FrameStream(
+                        target,
+                        width=camera_config.width,
+                        height=camera_config.height,
+                        rotation=camera_config.rotation,
+                    ).start()
+                    # Wait for the first delivered frame, otherwise the
+                    # next read below can see (None, gen) and be mistaken
+                    # for the end of a video file — killing the loop.
+                    first_frame, _ = new_stream.read()
+                    first_deadline = time.monotonic() + 10.0
+                    while first_frame is None and time.monotonic() < first_deadline:
+                        time.sleep(0.01)
+                        first_frame, _ = new_stream.read()
+                    if first_frame is None:
+                        raise ValueError(f"camera {target} delivers no frames")
+                except (ValueError, OSError) as exc:
+                    print(f"\n[ERROR] Camera switch to source {target} failed: {exc}"
+                          f" — keeping {source_label}.")
+                    recent_events.append(_camera_event(
+                        "camera_switch", "Camera switch failed",
+                        detail=f"Source {target}: {exc}", severity="warn"))
+                else:
+                    stream.release()
+                    stream = new_stream
+                    last_gen = None
+                    source = target
+                    source_index = int(target) if target.isdigit() else None
+                    source_label = (
+                        f"CAM-{int(target) + 1:02d}" if source_index is not None
+                        else (Path(target).name or "VIDEO")
+                    )
+                    cam_w, cam_h = (stream.frame_w or cam_w), (stream.frame_h or cam_h)
+                    disp_w, disp_h, coord_scale = _display_dims(camera_config, cam_w, cam_h)
+                    print(f"\n[INFO] Camera switched to source {target} ({source_label}).")
+                    recent_events.append(_camera_event(
+                        "camera_switch", "Camera source changed",
+                        detail=f"{source_label} selected"))
+        elif action == "rotate":
+            camera_config = load_camera_config(camera_config.path or DEFAULT_CAMERA_CONFIG_PATH)
+            rot = normalize_rotation(payload.get("rotation", 0))
+            if is_image:
+                frame_img = cv2.imread(str(source))
+                if frame_img is None:
+                    print("\n[ERROR] Rotation change could not re-read the image source.")
+                else:
+                    if rot:
+                        frame_img = rotate_frame(frame_img, rot)
+                    image = frame_img
+                    cam_w, cam_h = image.shape[1], image.shape[0]
+                    disp_w, disp_h, coord_scale = _display_dims(camera_config, cam_w, cam_h)
+            else:
+                old_rot = stream.rotation
+                stream.set_rotation(rot)
+                if stream.native_w and stream.native_h:
+                    cam_w, cam_h = rotated_size(stream.native_w, stream.native_h, rot)
+                    disp_w, disp_h, coord_scale = _display_dims(camera_config, cam_w, cam_h)
+                print(f"\n[INFO] Image rotation set to {rot}° (was {old_rot}°) — "
+                      "calibration rotated with the frame.")
+            recent_events.append(_camera_event(
+                "camera_rotation", "Image rotation changed",
+                detail=f"{rot} degrees clockwise" if rot else "No rotation (camera upright)"))
 
         if not headless:
             key = cv2.waitKey(1) & 0xFF
@@ -1182,6 +1310,35 @@ def run_detection(source=0, camera_config=None, monitor=None, detect_mode=None,
 # ─────────────────────────────────────────────────────────────
 #  COMMAND-LINE INTERFACE
 # ─────────────────────────────────────────────────────────────
+
+def probe_camera_index(idx, warmup_frames=4, warmup_delay=0.1, max_wait_s=3.0):
+    """Light availability probe for one webcam index (API camera list).
+
+    Unlike ``_probe_camera`` this never measures FPS and gives up within
+    ~3 s, so a `GET /api/dashboard/camera/sources` call stays fast. It
+    intentionally does NOT know whether another process holds the
+    device; a probe of the *active* source may therefore fail — the
+    caller marks the running source available without probing.
+    """
+    try:
+        cap = cv2.VideoCapture(int(idx))
+    except (TypeError, ValueError):
+        return False, (0, 0)
+    if not cap.isOpened():
+        return False, (0, 0)
+    ok, size = False, (0, 0)
+    deadline = time.monotonic() + max_wait_s
+    for _ in range(warmup_frames):
+        ret, f = cap.read()
+        if ret and f is not None:
+            ok, size = True, (f.shape[1], f.shape[0])
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(warmup_delay)
+    cap.release()
+    return ok, size
+
 
 def _probe_camera(idx, warmup_frames=20, warmup_delay=0.05):
     """Open camera at *idx*, read frames, return dict with results.
@@ -1477,18 +1634,6 @@ def parse_args():
              "(e.g. output/samples.jsonl); see scripts/evaluate_counts.py",
     )
     parser.add_argument(
-        "--monitor", action="store_true",
-        help="LEGACY: enable the core/ queue-monitor engine (Sensor 1 / people-m²) — future phase only",
-    )
-    parser.add_argument(
-        "--no-monitor", action="store_true",
-        help="Force the legacy queue-monitor engine OFF (default is already off)",
-    )
-    parser.add_argument(
-        "--config", default=None,
-        help="Path to the legacy queue-monitor engine YAML config (default: config/default.yaml)",
-    )
-    parser.add_argument(
         "--mode", default="standalone", choices=["standalone", "headless"],
         help="Runtime profile: 'standalone' (OpenCV GUI window) or 'headless' (FastAPI / Figma dashboard only)",
     )
@@ -1549,13 +1694,6 @@ if __name__ == "__main__":
                            camera_config.width, camera_config.height)
         sys.exit(0)
 
-    monitor = None
-    if args.monitor and not args.no_monitor:
-        if _CORE_AVAILABLE:
-            monitor = QueueMonitor(config_path=args.config)
-        else:
-            print("[WARN] core/ engine not importable — running without legacy queue monitoring.")
-
     is_headless = args.headless or (args.mode == "headless")
     api_enabled = args.api or is_headless
 
@@ -1586,9 +1724,9 @@ if __name__ == "__main__":
             print("[ERROR] Install with: pip install fastapi uvicorn")
             sys.exit(1)
 
-    run_detection(source=source, camera_config=camera_config, monitor=monitor,
+    run_detection(source=source, camera_config=camera_config,
                   detect_mode=args.detect_mode,
-                  sensor_id=SENSOR_ID, sensor_type=SENSOR_TYPE, record_path=args.record,
+                  record_path=args.record,
                   debug=args.debug, legacy_hud=args.legacy_hud,
                   samples_path=args.record_samples,
                   api_enabled=api_enabled,

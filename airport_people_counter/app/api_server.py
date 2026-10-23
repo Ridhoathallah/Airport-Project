@@ -39,11 +39,17 @@ from dashboard_models import (
     DashboardSnapshot,
     ConfigResponse,
     HealthResponse,
+    CameraSourceInfo,
+    CameraSourcesResponse,
+    CameraSelectRequest,
+    CameraRotationRequest,
+    CameraControlResult,
 )
 from dashboard_adapter import build_dashboard_snapshot, reset_adapter_state
 from snapshot_buffer import downsample, get_history_buffer
 from snapshot_holder import get_holder
 from queue_prototype import CameraConfig
+from orientation import VALID_ROTATIONS
 from shutdown import request_shutdown, start_watchdog
 
 
@@ -69,6 +75,35 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+def _config_rotation(config) -> int:
+    """Read camera rotation defensively (0 when absent/invalid)."""
+    try:
+        value = int(getattr(config, "rotation", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value in VALID_ROTATIONS else 0
+
+
+def _config_source_index(config) -> Optional[int]:
+    """Read camera source defensively; numeric only when really numeric."""
+    source = str(getattr(config, "source", "") or "")
+    return int(source) if source.isdigit() else None
+
+
+def _camera_field(obj, name, default):
+    """Return an additive camera attribute when its type fits the wire
+    contract, else the default.
+
+    Mock snapshots in tests expose auto-generated attributes for any
+    name, so ``getattr`` alone would hand a MagicMock to pydantic; this
+    guards the additive fields without hard-depending on every mock.
+    """
+    value = getattr(obj, name, default)
+    if isinstance(value, (str, int, float)) and value is not default:
+        return value
+    return default
 
 
 def _convert_snap(snap) -> Optional[APIQueueSnapshot]:
@@ -116,6 +151,9 @@ def _convert_snap(snap) -> Optional[APIQueueSnapshot]:
         fps=snap.camera_state.fps,
         resolution=snap.camera_state.resolution,
         frame_age_ms=snap.camera_state.frame_age_ms,
+        source_label=_camera_field(snap.camera_state, "source_label", ""),
+        source_index=_camera_field(snap.camera_state, "source_index", None),
+        rotation_deg=_camera_field(snap.camera_state, "rotation_deg", 0),
     )
     
     return APIQueueSnapshot(
@@ -352,6 +390,8 @@ async def get_dashboard_config():
         source_shape_h=getattr(config, "source_shape_h", None),
         mapping_active=bool(getattr(config, "mapping_active", False)),
         reference_point=_safe_reference_point(config),
+        rotation=_config_rotation(config),
+        source_index=_config_source_index(config),
     )
 
 
@@ -465,6 +505,230 @@ async def put_dashboard_mapping(payload: MappingPayload):
         mapping_active=True,
         reference_point=mapping.reference_point,
     )
+
+
+# ===== Camera source selection / image rotation (additive) =====
+
+#: Light camera-probe cache: probing opens the device briefly, so the
+#: list endpoint caches results instead of hammering every poll.
+_camera_probe_cache: dict = {"ts": 0.0, "available": {}}
+_CAMERA_PROBE_RANGE = range(5)  # webcam indexes 0–4
+_CAMERA_PROBE_TTL_S = 10.0
+
+
+def _probed_sources_dict() -> dict:
+    """Probe webcam indexes 0–4 (same thread as blocking callers)."""
+    from detect_people import probe_camera_index
+
+    now = time.monotonic()
+    if now - _camera_probe_cache["ts"] < _CAMERA_PROBE_TTL_S and _camera_probe_cache["available"]:
+        return dict(_camera_probe_cache["available"])
+    available = {}
+    for idx in _CAMERA_PROBE_RANGE:
+        ok, _ = probe_camera_index(idx)
+        available[idx] = ok
+    _camera_probe_cache["ts"] = now
+    _camera_probe_cache["available"] = available
+    return dict(available)
+
+
+@app.get("/api/dashboard/camera/sources", response_model=CameraSourcesResponse)
+async def get_camera_sources():
+    """List webcam sources for the selection control.
+
+    Probes indexes 0–4 with a light ~1.5 s-max probe each, cached for
+    10 s. The currently running source is reported available without a
+    probe — the probe cannot open a device the pipeline already holds.
+    """
+    from dashboard_models import CameraSourcesResponse, CameraSourceInfo
+    from camera_config_store import load_camera_yaml
+    from detect_people import DEFAULT_CAMERA_CONFIG_PATH
+    from queue_prototype import load_camera_config
+
+    loop = asyncio.get_running_loop()
+    probed = await loop.run_in_executor(None, _probed_sources_dict)
+    holder = get_holder()
+    snap = holder.get_latest_snapshot()
+    running_index = getattr(getattr(snap, "camera_state", None), "source_index", None)
+
+    doc = load_camera_yaml(DEFAULT_CAMERA_CONFIG_PATH)
+    cam_src = (doc.get("camera", {}) or {}).get("source")
+    persisted = int(cam_src) if isinstance(cam_src, int) else (
+        int(str(cam_src)) if isinstance(cam_src, str) and str(cam_src).isdigit() else None
+    )
+
+    sources = []
+    for idx in _CAMERA_PROBE_RANGE:
+        is_running = running_index is not None and idx == int(running_index)
+        sources.append(CameraSourceInfo(
+            index=idx,
+            available=bool(probed.get(idx)) or is_running,
+            running=is_running,
+        ))
+    return CameraSourcesResponse(sources=sources, current=persisted)
+
+
+@app.post("/api/dashboard/camera/select", response_model=CameraControlResult)
+async def select_camera_source(payload: CameraSelectRequest):
+    """Select which webcam feeds the lane — hot, no pipeline restart.
+
+    Guarantees (same pattern as the mapping endpoint):
+
+    1. Availability is probed BEFORE anything is written; an unavailable
+       index never touches disk or the running pipeline.
+    2. camera.yaml is updated atomically with a ``.bak``.
+    3. Only a successful persist asks the loop to swap the capture.
+       If opening the new camera fails, the loop keeps the old one and
+       logs the error — the config change is the operator intent and is
+       retried straight away on the next switch request.
+    """
+    from dashboard_models import CameraControlResult, CameraSelectRequest  # noqa: F401
+    from camera_config_store import update_camera_yaml
+    from camera_control import request_camera_control
+    from detect_people import probe_camera_index, DEFAULT_CAMERA_CONFIG_PATH
+    from queue_prototype import load_camera_config
+
+    config = load_camera_config(DEFAULT_CAMERA_CONFIG_PATH)
+    camera_id = config.camera_id or "CAMERA 01"
+    index = int(payload.index)
+
+    if index < 0 or index not in _CAMERA_PROBE_RANGE:
+        return CameraControlResult(
+            applied=False, camera_id=camera_id,
+            errors=[f"source index {index} is outside the supported range 0–{max(_CAMERA_PROBE_RANGE)}"],
+        )
+
+    running_index = getattr(
+        getattr(get_holder().get_latest_snapshot(), "camera_state", None),
+        "source_index", None,
+    )
+    if running_index is not None and index == int(running_index):
+        return CameraControlResult(
+            applied=True, camera_id=camera_id,
+            source_index=index,
+            rotation_deg=_config_rotation(config),
+            errors=[],
+        )
+
+    loop = asyncio.get_running_loop()
+    available, _ = await loop.run_in_executor(None, probe_camera_index, index)
+    if not available:
+        return CameraControlResult(
+            applied=False, camera_id=camera_id, source_index=index,
+            errors=[f"camera {index} is not available — nothing was changed"],
+        )
+
+    try:
+        update_camera_yaml(DEFAULT_CAMERA_CONFIG_PATH, {"camera.source": str(index)})
+    except (ValueError, OSError) as exc:
+        return CameraControlResult(
+            applied=False, camera_id=camera_id, source_index=index,
+            errors=[f"camera.yaml update failed: {exc}"],
+        )
+
+    request_camera_control({"action": "switch", "source": str(index)}, "api")
+    return CameraControlResult(
+        applied=True, camera_id=camera_id, source_index=index,
+        rotation_deg=_config_rotation(config), errors=[],
+    )
+
+
+@app.post("/api/dashboard/camera/rotation", response_model=CameraControlResult)
+async def set_camera_rotation(payload: CameraRotationRequest):
+    """Rotate the captured image 90°-step clockwise.
+
+    Rotation is applied at the capture edge (before detection), and the
+    active calibration geometry is rotated by the same delta so the
+    calibrated region keeps covering the same physical scene area:
+
+    - mapping-driven geometry: ``mappings.yaml`` entry is rotated and
+      saved atomically (``mappings.yaml.bak``);
+    - legacy pixel geometry: ``camera.yaml`` ROI/line/xray side points
+      and ``source.shape_w/h`` are rotated in the same atomic write as
+      the new ``camera.rotation`` value.
+
+    A no-op rotation (same value) applies nothing. A failed geometry
+    transform leaves both files untouched.
+    """
+    from dashboard_models import CameraControlResult, CameraRotationRequest  # noqa: F401
+    from camera_config_store import update_camera_yaml
+    from camera_control import request_camera_control
+    from mapping import save_mapping, default_mappings_path, validate_mapping, MappingError
+    from orientation import rotate_mapping, transform_legacy_layout, delta_rotation, rotated_size
+    from queue_prototype import load_camera_config
+    from detect_people import DEFAULT_CAMERA_CONFIG_PATH
+
+    config = load_camera_config(DEFAULT_CAMERA_CONFIG_PATH)
+    camera_id = config.camera_id or "CAMERA 01"
+    degrees = int(payload.degrees)
+    current = _config_rotation(config)
+    result = CameraControlResult(
+        applied=True, camera_id=camera_id,
+        source_index=_config_source_index(config),
+        rotation_deg=degrees, errors=[],
+    )
+    if degrees not in VALID_ROTATIONS:
+        result.applied = False
+        result.errors = [f"rotation must be one of {VALID_ROTATIONS}"]
+        return result
+    delta = delta_rotation(current, degrees)
+    if delta == 0:
+        return result
+
+    updates: dict = {"camera.rotation": degrees}
+    if getattr(config, "mapping_source", "") == "mappings.yaml" and getattr(config, "mapping", None) is not None:
+        # Mapping-driven lane: rotate the persisted mappings.yaml entry.
+        rotated = rotate_mapping(config.mapping, delta)
+        errors = validate_mapping(rotated, rotated.source_shape)
+        if errors:
+            result.applied = False
+            result.errors = [f"rotation would break the calibration: {'; '.join(errors)}"]
+            return result
+        try:
+            save_mapping(default_mappings_path(DEFAULT_CAMERA_CONFIG_PATH), rotated)
+        except (MappingError, OSError) as exc:
+            result.applied = False
+            result.errors = [f"mappings.yaml update failed: {exc}"]
+            return result
+    elif config.roi or config.counting_line or config.xray_side_point:
+        # Legacy pixel geometry: rotate the camera.yaml points in the
+        # same atomic write as the rotation value. The legacy-derived
+        # mapping is in-memory only and must never be persisted back
+        # (see load_camera_config), so the pixels stay authoritative.
+        size = (
+            int(config.source_shape_w or config.width or 0),
+            int(config.source_shape_h or config.height or 0),
+        )
+        if size[0] <= 0 or size[1] <= 0:
+            result.applied = False
+            result.errors = [
+                "legacy pixel geometry needs a known frame shape — set camera.source.shape_w/h first",
+            ]
+            return result
+        legacy = transform_legacy_layout(
+            config.roi, config.counting_line, config.xray_side_point, delta, size,
+        )
+        updates.update({f"camera.{key}": value for key, value in legacy.items()})
+        new_w, new_h = rotated_size(size[0], size[1], delta)
+        updates["source.shape_w"] = new_w
+        updates["source.shape_h"] = new_h
+
+    try:
+        update_camera_yaml(DEFAULT_CAMERA_CONFIG_PATH, updates)
+    except (ValueError, OSError) as exc:
+        # camera.yaml is authoritative for rotation; without this write
+        # the mapping file must stay pre-rotation too.
+        if getattr(config, "mapping_source", "") == "mappings.yaml" and getattr(config, "mapping", None) is not None:
+            try:
+                save_mapping(default_mappings_path(DEFAULT_CAMERA_CONFIG_PATH), config.mapping)
+            except (MappingError, OSError):
+                pass  # reported below regardless
+        result.applied = False
+        result.errors = [f"camera.yaml update failed: {exc}"]
+        return result
+
+    request_camera_control({"action": "rotate", "rotation": degrees}, "api")
+    return result
 
 
 @app.get("/api/dashboard/health", response_model=HealthResponse)

@@ -52,6 +52,13 @@ class CameraState:
     fps: float
     resolution: str
     frame_age_ms: int
+    # ── Camera identity/orientation (additive; "" / None / 0 = unknown) ──
+    #: Operator-facing chrome label, e.g. "CAM-01" or "WEBCAM".
+    source_label: str = ""
+    #: Which webcam index is live (None for file / IP / image sources).
+    source_index: Optional[int] = None
+    #: Clockwise rotation applied at the capture edge.
+    rotation_deg: int = 0
 
 
 @dataclass(frozen=True)
@@ -112,6 +119,10 @@ class QueueSnapshot:
     events: List[Event] = field(default_factory=list)
     #: Compute device the inference ran on ("mps", "cpu", "cuda:0", ...).
     device: str = ""
+    predicted_wait_s: float = 0.0
+    clearance_time_s: float = 0.0
+    service_time_s: float = 0.0
+    pacing_status: str = "STEADY"
 
 
 class SnapshotBuilder:
@@ -148,11 +159,22 @@ class SnapshotBuilder:
         else:
             link = "ONLINE"
 
+        # Report the frame size actually being analysed — the camera's
+        # real capture or, when rotation ≠ 0, the rotated shape — instead
+        # of repeating the requested config resolution.
+        if system.frame_w > 0 and system.frame_h > 0:
+            resolution = f"{system.frame_w}x{system.frame_h}"
+        else:
+            resolution = f"{config.width or '?'}x{config.height or '?'}"
+
         return CameraState(
             link=link,
             fps=system.capture_fps,
-            resolution=f"{config.width or '?'}x{config.height or '?'}",
+            resolution=resolution,
             frame_age_ms=int(1000 / system.capture_fps) if system.capture_fps > 0 else 0,
+            source_label=system.source_label,
+            source_index=system.source_index,
+            rotation_deg=system.rotation_deg,
         )
 
     @staticmethod
@@ -194,6 +216,8 @@ class SnapshotBuilder:
             "congestion_end": "congestion",
             "state_change": "state",
             "track_lost": "system",
+            "camera_switch": "system",
+            "camera_rotation": "system",
         }
         severity_map = {
             "info": "info",
@@ -280,6 +304,14 @@ class SnapshotBuilder:
             detail = f"Congestion lasted {_format_duration(duration)}" if isinstance(duration, (int, float)) else None
             return "Queue beginning to clear", detail
 
+        if et == "camera_switch":
+            detail = str(e["detail"]) if e.get("detail") else None
+            return "Camera source changed", detail
+
+        if et == "camera_rotation":
+            detail = str(e["detail"]) if e.get("detail") else None
+            return "Image rotation changed", detail
+
         # Anything unexpected still reaches the operator in plain words.
         return str(e.get("label") or et.replace("_", " ").capitalize()), e.get("detail")
 
@@ -287,7 +319,8 @@ class SnapshotBuilder:
     def _technical_event_text(e: dict) -> str:
         """The engineering description of an event, for the diagnostics view."""
         parts = [str(e.get("event_type", "event"))]
-        for key in ("track_id", "direction", "from_state", "to_state", "state", "confidence"):
+        for key in ("track_id", "direction", "from_state", "to_state", "state",
+                    "confidence", "source", "rotation"):
             if key in e and e[key] is not None:
                 parts.append(f"{key}={e[key]}")
         if isinstance(e.get("waiting_s"), (int, float)):
@@ -332,6 +365,10 @@ class SnapshotBuilder:
             exit_rate=q.exit_flow,
             avg_wait_s=q.avg_wait_s,
             longest_wait_s=q.longest_wait_s,
+            predicted_wait_s=getattr(q, "predicted_wait_s", 0.0),
+            clearance_time_s=getattr(q, "clearance_time_s", 0.0),
+            service_time_s=getattr(q, "service_time_s", 0.0),
+            pacing_status=getattr(q, "pacing_status", "STEADY"),
             congestion_duration_s=q.congestion_duration_s,
             spacing_px=q.spacing_px,
             movement=q.movement,  # type: ignore[arg-type]

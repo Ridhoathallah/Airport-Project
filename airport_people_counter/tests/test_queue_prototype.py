@@ -935,5 +935,65 @@ class TestMappingDrivenCrossings(unittest.TestCase):
         self.assertEqual(len(events), 1)
 
 
+
+class TestServiceTimeTrackerAndPredictiveWait(unittest.TestCase):
+    def test_service_tracker_initial_and_smoothed_exit(self):
+        from queue_prototype import ServiceTimeTracker
+        tracker = ServiceTimeTracker(baseline_service_s=20.0, alpha=0.5)
+        self.assertEqual(tracker.smoothed_service_s, 20.0)
+        self.assertEqual(tracker.estimate_wait_seconds(0, 1000.0), 0.0)
+        self.assertEqual(tracker.estimate_wait_seconds(5, 1000.0), 100.0)
+
+        # Record first exit at t=1000
+        tracker.record_exit(1000.0)
+        # Record second exit at t=1030 (delta = 30s) -> EMA: 0.5 * 30 + 0.5 * 20 = 25.0s
+        tracker.record_exit(1030.0)
+        self.assertEqual(tracker.smoothed_service_s, 25.0)
+        self.assertEqual(tracker.estimate_wait_seconds(4, 1030.0), 100.0)
+
+    def test_pacing_status_transitions(self):
+        from queue_prototype import ServiceTimeTracker
+        tracker = ServiceTimeTracker(baseline_service_s=12.0)
+        self.assertEqual(tracker.pacing_status(0, 1000.0), "IDLE")
+        self.assertEqual(tracker.pacing_status(3, 1000.0), "OPTIMAL")
+
+        # Stagnant when queue > 0 and no exit for > 90s
+        tracker.record_exit(1000.0)
+        self.assertEqual(tracker.pacing_status(3, 1100.0), "STAGNANT")
+
+    def test_spatial_continuity_reassociation_preserves_entry_time(self):
+        """When a track is occluded/lost in ROI and reappears nearby, entry time is preserved."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(tmp, track_lost_grace_seconds=1.0)
+            a = QueueAnalytics(cfg)
+            now = 5000.0
+
+            # Person 1 enters ROI at (200, 200)
+            snap = a.update([track(1, 180, 180, 220, 220)], SHAPE, now_unix=now)
+            self.assertEqual(snap["people_in_queue"], 1)
+            self.assertEqual(a.persons[1].entry_unix, now)
+
+            # Frame 2: Person 1 is lost (occluded)
+            now += 0.5
+            snap = a.update([], SHAPE, now_unix=now)
+            # Not yet pruned since < track_lost_grace_seconds
+            self.assertEqual(snap["people_in_queue"], 1)
+
+            # Frame 3: Past grace period -> pruned and stored in _lost_roi_tracks
+            now += 1.5
+            snap = a.update([], SHAPE, now_unix=now)
+            self.assertEqual(snap["people_in_queue"], 0)
+            self.assertIn(1, a._lost_roi_tracks)
+
+            # Frame 4: Person reappears as Track 2 at (205, 205) within 90px
+            now += 0.2
+            snap = a.update([track(2, 185, 185, 225, 225)], SHAPE, now_unix=now)
+            self.assertEqual(snap["people_in_queue"], 1)
+            # Entry unix must be the original 5000.0!
+            self.assertEqual(a.persons[2].entry_unix, 5000.0)
+            # Waiting time must be now - 5000.0 = 2.2s, NOT 0!
+            self.assertAlmostEqual(snap["waiting"]["average_s"], 2.2, places=1)
+
+
 if __name__ == "__main__":
     unittest.main()

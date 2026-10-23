@@ -50,6 +50,21 @@ _CV_TO_UI_STATE: dict[str, Literal["NORMAL", "BUSY", "CONGESTED", "BACKLOG"]] = 
 # CV states that indicate unconfigured
 _UNCONFIGURED_CV_STATES = {"UNCONFIGURED", "DATA_UNAVAILABLE"}
 
+
+def _camera_field(obj, name, default, type_allowed=None):
+    """Read an additive camera attribute with a type guard.
+
+    Mock snapshots in tests expose auto-generated attributes for any
+    name; ``getattr`` alone would hand a MagicMock to pydantic. This
+    only accepts values matching the wire contract, so older pipeline
+    snapshots and mocks alike fall back to the documented default.
+    """
+    value = getattr(obj, name, default)
+    if type_allowed is not None and not type_allowed(value):
+        return default
+    return value
+
+
 # Module-level state for OFFLINE freeze. When the camera signal is lost the
 # last trustworthy readings are held so the operator keeps context instead of
 # seeing a dashboard jump to zero.
@@ -163,6 +178,17 @@ def _convert_tracks(internal_tracks: List) -> List[TrackInfo]:
     return result
 
 
+def _optional_text(value) -> Optional[str]:
+    """Return the value when it is text, otherwise None.
+
+    The dashboard endpoint must not fail because one event carries an
+    unexpected type: a single bad field would blank the whole console.
+    """
+    if isinstance(value, str):
+        return value
+    return None
+
+
 def _convert_events(internal_events: List) -> List[EventInfo]:
     """Convert internal Event objects to EventInfo."""
     result = []
@@ -174,8 +200,8 @@ def _convert_events(internal_events: List) -> List[EventInfo]:
             kind=e.kind,
             severity=e.severity,
             label=e.label,
-            detail=e.detail,
-            technical=getattr(e, "technical", None),
+            detail=_optional_text(getattr(e, "detail", None)),
+            technical=_optional_text(getattr(e, "technical", None)),
         ))
     return result
 
@@ -270,6 +296,18 @@ def build_dashboard_snapshot(
         packet_loss=None,
         last_frame_age_ms=snap.staleness_ms,
         uptime_sec=int(current_time - server_start_ts),
+        source_label=_camera_field(
+            snap.camera_state, "source_label", "",
+            type_allowed=lambda v: isinstance(v, str),
+        ),
+        source_index=_camera_field(
+            snap.camera_state, "source_index", None,
+            type_allowed=lambda v: v is None or isinstance(v, int),
+        ),
+        rotation_deg=_camera_field(
+            snap.camera_state, "rotation_deg", 0,
+            type_allowed=lambda v: isinstance(v, int),
+        ),
     )
 
     # --- System block ---
@@ -316,6 +354,10 @@ def build_dashboard_snapshot(
         reason=reason,
         source_state=source_state,
         action=_recommendation_for(display_state, config) if state_active else None,
+        predicted_wait=round(getattr(snap, "predicted_wait_s", 0.0) / 60.0, 1),
+        clearance_time=round(getattr(snap, "clearance_time_s", 0.0) / 60.0, 1),
+        service_time_s=round(getattr(snap, "service_time_s", 20.0), 1),
+        pacing_status=getattr(snap, "pacing_status", "STEADY"),
     )
 
     # --- Tracks ---

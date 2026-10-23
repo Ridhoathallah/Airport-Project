@@ -32,6 +32,10 @@ class QueueTelemetry(BaseModel):
     #: Operational guidance for the current condition, taken from the
     #: config-overridable recommendation table. Operator-facing language.
     action: Optional[str] = None
+    predicted_wait: Optional[float] = None
+    clearance_time: Optional[float] = None
+    service_time_s: Optional[float] = None
+    pacing_status: Optional[str] = "STEADY"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -63,6 +67,13 @@ class CameraTelemetry(BaseModel):
     packet_loss: Optional[float] = None
     last_frame_age_ms: int
     uptime_sec: int
+    #: Camera chrome label reported by the pipeline, e.g. "CAM-01"
+    #: ("" when an older pipeline does not report it).
+    source_label: str = ""
+    #: Live webcam index (None for file/IP/image sources or unknown).
+    source_index: Optional[int] = None
+    #: Clockwise rotation applied at the capture edge.
+    rotation_deg: int = 0
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -163,6 +174,12 @@ class ConfigResponse(BaseModel):
     #: The active mapping reference point ("bottom_center"/"centroid").
     reference_point: Optional[str] = None
 
+    # ── Camera source / rotation (additive) ────────────────────────
+    #: Clockwise rotation persisted in camera.yaml (0/90/180/270).
+    rotation: Optional[int] = None
+    #: Persisted camera.yaml source when numeric ("" for files/URLs).
+    source_index: Optional[int] = None
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -185,6 +202,59 @@ class MappingLinePayload(BaseModel):
     points: List[List[float]]
     #: What a forward crossing of this line counts as.
     direction: Literal["IN", "OUT"]
+
+
+class CameraSourceInfo(BaseModel):
+    """One probed webcam index in the camera-list endpoint."""
+
+    index: int
+    available: bool
+    #: The running source is marked available without probing (the probe
+    #: would fail against the device the pipeline already holds open).
+    running: bool = False
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CameraSourcesResponse(BaseModel):
+    sources: List[CameraSourceInfo]
+    #: Persisted camera.yaml source (None when unset or non-numeric).
+    current: Optional[int] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CameraSelectRequest(BaseModel):
+    """Body of ``POST /api/dashboard/camera/select``."""
+
+    index: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CameraRotationRequest(BaseModel):
+    """Body of ``POST /api/dashboard/camera/rotation``."""
+
+    degrees: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CameraControlResult(BaseModel):
+    """Result of camera select / rotation requests.
+
+    ``applied`` is ``False`` when validation failed; ``errors`` then
+    carries one human-readable reason per problem and the running
+    pipeline (and the persisted config) is left untouched.
+    """
+
+    applied: bool
+    camera_id: str
+    source_index: Optional[int] = None
+    rotation_deg: int = 0
+    errors: List[str] = []
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MappingPayload(BaseModel):

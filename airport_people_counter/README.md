@@ -4,6 +4,18 @@
 
 ## Quick Start
 
+The whole system (camera pipeline + API + dashboard) starts with one
+command from the project root:
+
+```bash
+cd ..
+./start.sh                 # camera 0, dashboard on http://localhost:8443
+./start.sh --source 1      # a different camera
+./start.sh --source clip.mp4
+```
+
+To run only the backend:
+
 ```bash
 # Webcam + API (port 8080)
 ./run.sh --api
@@ -99,6 +111,28 @@ classifier:
 | `GET /api/config` | Camera configuration (read-only) |
 | `GET /api/events` | Recent events |
 | `GET /api/camera/stream` | MJPEG stream |
+| `GET /api/dashboard/snapshot` | Dashboard snapshot: queue, system, camera, history, events |
+| `GET /api/dashboard/config` | Dashboard configuration (ROI, counting line, calibration) |
+| `GET /api/dashboard/health` | Dashboard health status |
+| `GET /api/dashboard/history?points=N` | Occupancy history, N evenly spaced samples (2–3600) |
+| `POST /api/shutdown` | Stop the pipeline and the API server |
+
+### Dashboard payload notes
+
+| Field | Meaning |
+|-------|---------|
+| `queue.action` | Operational guidance for the current condition. Taken from the config-overridable `recommendations:` table, never invented by the dashboard. |
+| `queue.reason` | Why the classifier produced this state. |
+| `events[].label` / `events[].detail` | Operator-facing wording. Internal state names are translated before they leave the backend. |
+| `events[].technical` | The engineering description of the same event, for the diagnostics view only. |
+| `config.wait_alert_seconds` | The wait duration the detector treats as long enough to contribute to a backlog condition. Used as the waiting-time threshold marker. |
+
+### History sampling
+
+Occupancy history is sampled on a fixed **1 Hz** grid and kept for 60 minutes
+(3600 samples). The polled snapshot carries an evenly spaced view of it (at
+most 240 points, one per 15 s), so the dashboard's 5m / 15m / 30m / 60m
+ranges describe real elapsed time rather than a number of frames.
 
 ## Architecture
 
@@ -115,14 +149,18 @@ Camera → YOLOv5s → SORT → QueueAnalytics → SnapshotBuilder → SnapshotH
 ## Testing
 
 ```bash
-make test          # All 262 tests (unittest discover)
+make test          # Every test: unittest discover + pytest
 make smoke         # Offline image test
 ./run.sh --test-camera  # Camera FPS test
 ```
 
-Both runners collect the same suite: `make test` (unittest discover, 262
-tests) and `venv/bin/python -m pytest tests/` (294 tests — it also
-collects the pytest-style cases unittest skips).
+The suite is written in two styles, so `make test` invokes both runners:
+`unittest discover` (262 `TestCase` tests) and `pytest` (308 tests, which
+also collects the pytest-style function tests unittest skips: the history
+buffer, the dashboard adapter, the dashboard API, the dashboard models and
+the event language). `make test-unittest` and `make test-pytest` run one
+runner each. pytest is optional: if it is not installed, `make test` runs
+the unittest suite and says so.
 
 ## ML Dataset & Experiment Tooling
 

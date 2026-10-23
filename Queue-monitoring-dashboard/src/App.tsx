@@ -71,7 +71,7 @@ export default function App() {
 
         <div className="flex shrink-0 items-center gap-md">
           {isLive && apiError && (
-            <div className="flex items-center gap-xs rounded-corner-sm border border-border-control px-sm py-1">
+            <div className="flex items-center gap-xs rounded-corner-sm border border-control px-sm py-1">
               <span className="h-1.5 w-1.5 rounded-full" style={{ background: "var(--st-busy)" }} aria-hidden />
               <span className="text-[11px] font-semibold" style={{ color: "var(--st-busy)" }}>
                 Reconnecting

@@ -2,16 +2,18 @@
 
 ## Overview
 
-All runtime configuration for the camera-only prototype lives in **`config/camera.yaml`**.
+Runtime configuration lives in two files with a strict division:
 
-This file is the **single source of truth** for:
-- Camera capture settings
-- Queue layout (ROI, counting line, X-ray side)
-- Classifier thresholds
-- Backlog conditions
-- Calibration
-- Dashboard layout
-- Movement classification
+- **`config/camera.yaml`** — behaviour: capture settings, classifier
+  thresholds, backlog conditions, calibration, dashboard layout, movement
+  classification, plus the **legacy** pixel geometry (ROI, counting line,
+  X-ray side) used only as fallback.
+- **`config/mappings.yaml`** — **queue geometry source of truth** while a
+  valid entry exists (per camera, normalised coordinates). Written by the
+  dashboard mapping editor / `PUT /api/dashboard/mapping`.
+
+Never combine the two: a valid mapping fully replaces the legacy geometry
+(see [ARCHITECTURE.md](ARCHITECTURE.md) § Configuration Flow).
 
 ---
 
@@ -46,6 +48,11 @@ camera:                          # ✅ IMPLEMENTED
   # If unsupported, camera falls back to nearest supported resolution.
   width: 0                       # ✅ IMPLEMENTED
   height: 0                      # ✅ IMPLEMENTED
+
+  # Clockwise image rotation applied before detection: 0 / 90 / 180 / 270.
+  # Lane-level setting: calibrated geometry rotates with the frame so the
+  # same physical region stays covered. 0 = upright (default).
+  rotation: 0                    # ✅ IMPLEMENTED
 
   # Display scale relative to captured frame width (1.0 = full native).
   # 0.5 = half width. Lower = faster rendering, smaller window.
@@ -152,7 +159,8 @@ dashboard:                       # ✅ IMPLEMENTED
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
 | `camera_id` | string | `"CAMERA 01"` | No | Label in dashboard header |
-| `source` | string\|int | `0` | No | Webcam index, video path, or RTSP/HTTP URL. CLI `--source` overrides |
+| `source` | string\|int | `0` | No | Webcam index, video path, or RTSP/HTTP URL. CLI `--source` overrides. Also changeable at runtime via `POST /api/dashboard/camera/select` (see [API.md](API.md)) |
+| `rotation` | int | `0` | No | Clockwise image rotation applied before detection: `0`/`90`/`180`/`270`. Lane-level setting (applies to whichever source is active). Calibrated geometry rotates with the frame. Changeable at runtime via `POST /api/dashboard/camera/rotation` |
 | `width` | int | `0` | No | Requested capture width (0 = native) |
 | `height` | int | `0` | No | Requested capture height (0 = native) |
 | `display_scale` | float | `1.0` | No | Window size relative to capture (0.5 = half) |
@@ -320,15 +328,31 @@ Overrides built-in defaults for specific states.
 
 ## Configuration Workflow
 
-### 1. Initial Setup (Required)
+### 1. Calibrate Geometry (Required)
+**Preferred:** dashboard → Live camera panel → **“Edit mapping”** — draw the
+queue ROI and IN/OUT lines on the raw feed; saved atomically to
+`config/mappings.yaml`, hot-reloaded on the next frame.
+
+The editor is a separate mode: monitoring stays untouched while it is
+closed. Inside it, **Save** and **Apply** stay disabled while the draft
+has validation problems, and the problems are listed next to the offending
+geometry (for example a line whose two endpoints have collapsed onto each
+other). **Cancel** leaves the stored mapping untouched; **Revert** returns
+the draft to the last stored version; **Preview saved** ghosts the stored
+geometry over the draft.
+
+If the backend refuses a save, the stored mapping is not replaced and
+the running detector keeps the last known-good geometry.
+
+**Legacy alternative** (writes pixel geometry to `camera.yaml`):
 ```bash
 ./run.sh --define-roi
 ```
-Interactive tool draws ROI, counting line, X-ray side point → saves to `camera.yaml`.
 
 ### 2. Verify Layout
 ```bash
-./run.sh --roi-preview
+./run.sh --roi-preview                     # legacy geometry preview
+# or reopen “Edit mapping” — saved geometry is ghosted over the raw feed
 ```
 
 ### 3. Calibrate Classifier Thresholds
