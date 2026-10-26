@@ -145,7 +145,7 @@ def _convert_snap(snap) -> Optional[APIQueueSnapshot]:
         classifier_enabled=snap.config_status.classifier_enabled,
     )
     
-    # Convert camera state
+    # Convert camera state (incl. the capture-supervisor lifecycle status)
     api_camera = APICameraState(
         link=snap.camera_state.link,
         fps=snap.camera_state.fps,
@@ -154,6 +154,7 @@ def _convert_snap(snap) -> Optional[APIQueueSnapshot]:
         source_label=_camera_field(snap.camera_state, "source_label", ""),
         source_index=_camera_field(snap.camera_state, "source_index", None),
         rotation_deg=_camera_field(snap.camera_state, "rotation_deg", 0),
+        status=_camera_field(snap.camera_state, "status", ""),
     )
     
     return APIQueueSnapshot(
@@ -198,25 +199,30 @@ async def get_snapshot():
 @app.get("/api/health", response_model=APIHealthResponse)
 async def get_health():
     """Get camera and CV pipeline health status."""
+    from dashboard_adapter import _component_statuses
+
     holder = get_holder()
     snap = holder.get_latest_snapshot()
 
     if snap is None:
         return APIHealthResponse(
-            camera=APICameraState(link="OFFLINE", fps=0.0, resolution="?", frame_age_ms=0),
+            camera=APICameraState(
+                link="OFFLINE", fps=0.0, resolution="?", frame_age_ms=0,
+                status="OFFLINE",
+            ),
             cv={"detection": "STALLED", "tracking": "STALLED", "analytics": "STALLED"},
             recording={"active": False},
             data={"status": "NO_DATA"},
         )
 
-    cv_status = "OK" if snap.fps > 0 else "STALLED"
+    statuses = _component_statuses(snap)
     api_snap = _convert_snap(snap)  # type: ignore[assignment]
     return APIHealthResponse(
         camera=api_snap.camera_state,
         cv={
-            "detection": cv_status,
-            "tracking": cv_status,
-            "analytics": cv_status,
+            "detection": statuses["detection"],
+            "tracking": statuses["tracking"],
+            "analytics": statuses["analytics"],
             "inference_ms": snap.inference_ms,
             "model": "YOLOv5s",
             "tracker": "SORT",
@@ -331,22 +337,15 @@ async def camera_stream(annotated: int = Query(1, ge=0, le=1)):
 
 @app.get("/api/dashboard/snapshot", response_model=DashboardSnapshot)
 async def get_dashboard_snapshot():
-    """Get the latest dashboard-shaped snapshot for dashboard polling (1 Hz)."""
+    """Get the latest dashboard-shaped snapshot for dashboard polling (1 Hz).
+
+    ``snap is None`` means the pipeline thread has not produced anything
+    yet (API up, pipeline down or not started). The adapter then reports
+    an honest all-null, DATA_UNAVAILABLE snapshot instead of fabricated
+    zeros.
+    """
     holder = get_holder()
     snap = holder.get_latest_snapshot()
-
-    if snap is None:
-        # Return a minimal snapshot with defaults
-        from queue_prototype import load_camera_config
-        from detect_people import DEFAULT_CAMERA_CONFIG_PATH
-        config = load_camera_config(DEFAULT_CAMERA_CONFIG_PATH)
-        history_buf = get_history_buffer()
-        return build_dashboard_snapshot(
-            snap=MockEmptySnapshot(),
-            config=config,
-            history=history_buf.snapshot(),
-            server_start_ts=SERVER_START_TS,
-        )
 
     from queue_prototype import load_camera_config
     from detect_people import DEFAULT_CAMERA_CONFIG_PATH
@@ -602,7 +601,15 @@ async def select_camera_source(payload: CameraSelectRequest):
         getattr(get_holder().get_latest_snapshot(), "camera_state", None),
         "source_index", None,
     )
-    if running_index is not None and index == int(running_index):
+    running_link = getattr(
+        getattr(get_holder().get_latest_snapshot(), "camera_state", None),
+        "link", None,
+    )
+    # "Already running" is only a shortcut when the camera is actually
+    # delivering frames. With the camera offline the operator selecting
+    # the same index IS the manual retry, so the switch goes through and
+    # the loop re-opens the device.
+    if running_index is not None and index == int(running_index) and running_link == "ONLINE":
         return CameraControlResult(
             applied=True, camera_id=camera_id,
             source_index=index,
@@ -733,7 +740,17 @@ async def set_camera_rotation(payload: CameraRotationRequest):
 
 @app.get("/api/dashboard/health", response_model=HealthResponse)
 async def get_dashboard_health():
-    """Get dashboard health status."""
+    """Get dashboard health status.
+
+    ``status`` is the pipeline availability summary, not a rubber stamp:
+
+    - ``NO_DATA``     API is up but the pipeline has not produced anything;
+    - ``CAMERA_OFFLINE`` the camera is unavailable (retries in progress,
+      exhausted, or never produced frames);
+    - ``STALE``       frames stopped arriving while the camera link is up;
+    - ``DEGRADED``    frames flow, but slowly (low capture rate);
+    - ``OK``          camera online and frames fresh.
+    """
     holder = get_holder()
     snap = holder.get_latest_snapshot()
 
@@ -747,7 +764,15 @@ async def get_dashboard_health():
 
     camera_ok = snap.camera_state.link == "ONLINE"
     last_frame_age_ms = snap.staleness_ms
-    status = "OK" if camera_ok else "DEGRADED"
+
+    if snap.camera_state.link == "OFFLINE":
+        status = "CAMERA_OFFLINE"
+    elif snap.freshness == "STALE":
+        status = "STALE"
+    elif snap.camera_state.link == "DEGRADED":
+        status = "DEGRADED"
+    else:
+        status = "OK"
 
     return HealthResponse(
         status=status,
@@ -794,32 +819,6 @@ async def shutdown_server():
     """Stop the backend: the detection loop exits, then the process ends."""
     _shutdown_server()
     return {"status": "shutting_down"}
-
-
-# Mock empty snapshot for when no data available
-class MockEmptySnapshot:
-    """Minimal snapshot-like object for empty state."""
-    people_in_queue = 0
-    queue_state = "DATA_UNAVAILABLE"
-    occupancy_percent = 0.0
-    congestion_duration_s = 0.0
-    entry_rate = 0.0
-    exit_rate = 0.0
-    avg_wait_s = 0.0
-    longest_wait_s = 0.0
-    fps = 0.0
-    inference_ms = 0.0
-    detection_count = 0
-    tracked_people = 0
-    timestamp = "2024-01-01T00:00:00Z"
-    tracks = []
-    events = []
-    staleness_ms = 0
-    camera_state = type('obj', (object,), {
-        'link': 'OFFLINE',
-        'fps': 0.0,
-        'resolution': '?',
-    })()
 
 
 def run_api_server(host: str = "0.0.0.0", port: int = 8080):

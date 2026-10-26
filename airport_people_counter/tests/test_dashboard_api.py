@@ -19,7 +19,13 @@ client = TestClient(app)
 
 
 def _make_mock_snap():
-    """Create a mock snapshot with all required fields."""
+    """Create a mock snapshot shaped like the internal QueueSnapshot.
+
+    Every attribute the adapter reads is set explicitly: a bare
+    MagicMock auto-creates any missing attribute, which hides contract
+    drift (that is exactly how the original test passed while the
+    adapter was validating garbage).
+    """
     mock_snap = MagicMock()
     mock_snap.people_in_queue = 5
     mock_snap.queue_state = "NORMAL"
@@ -39,7 +45,11 @@ def _make_mock_snap():
     mock_snap.tracks = [MagicMock(id=1, x=0.5, y=0.5, w=0.1, h=0.2, in_roi=True, confidence=0.95, age=10, hits=8, state="active")]
     mock_snap.events = [MagicMock(id=1, t=1700000000000, kind="entry", severity="info", label="Test", detail=None)]
     mock_snap.staleness_ms = 48
-    mock_snap.camera_state = MagicMock(link="ONLINE", fps=24.0, resolution="1920x1080", frame_age_ms=48)
+    # Camera block per the CameraState contract (incl. additive fields).
+    mock_snap.camera_state = MagicMock(
+        link="ONLINE", fps=24.0, resolution="1920x1080", frame_age_ms=48,
+        source_label="CAM-01", source_index=None, rotation_deg=0, status="OK",
+    )
     mock_snap.config_status = MagicMock(roi_configured=True, line_configured=True, calibrated=True, classifier_enabled=False)
     mock_snap.calibration = "calibrated"  # Pydantic expects string
     mock_snap.frame_id = 1
@@ -48,6 +58,12 @@ def _make_mock_snap():
     mock_snap.total_out = 95
     mock_snap.spacing_px = 1.5
     mock_snap.movement = "normal"  # Pydantic expects string
+    # Frame clock + estimator outputs the adapter reports when measured.
+    mock_snap.last_frame_unix = 1705314600.0
+    mock_snap.predicted_wait_s = 180.0   # 3 min on the wire
+    mock_snap.clearance_time_s = 600.0   # 10 min on the wire
+    mock_snap.service_time_s = 18.5
+    mock_snap.pacing_status = "STEADY"
     return mock_snap
 
 
@@ -99,6 +115,20 @@ def test_dashboard_snapshot_endpoint():
             assert "events" in data
             assert "tracks" in data
             assert "frame_ts" in data
+            # Contract: availability summary vs classifier vocabulary,
+            # camera lifecycle status, and measured estimator outputs.
+            assert data["scenario"] == "ONLINE"
+            assert data["queue"]["state"] in {
+                "EMPTY", "SPARSE", "NORMAL", "CROWDED", "CONGESTED",
+                "BACKLOG", "UNCONFIGURED", "DATA_UNAVAILABLE",
+            }
+            assert data["queue"]["state_active"] is True
+            assert data["queue"]["predicted_wait"] == 3.0   # 180 s → 3 min
+            assert data["queue"]["clearance_time"] == 10.0  # 600 s → 10 min
+            assert data["queue"]["service_time_s"] == 18.5
+            assert data["queue"]["pacing_status"] == "STEADY"
+            assert data["camera"]["status"] == "OK"
+            assert data["camera"]["source_label"] == "CAM-01"
 
 
 def test_dashboard_config_endpoint():
@@ -149,7 +179,10 @@ def test_dashboard_health_offline():
         response = client.get("/api/dashboard/health")
         assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "DEGRADED"
+        # A dead camera link is CAMERA_OFFLINE, distinct from DEGRADED
+        # (frames flowing, but slowly) so the operator can tell
+        # "camera lost" apart from "camera slow".
+        assert data["status"] == "CAMERA_OFFLINE"
         assert data["camera"] is False
         assert data["api"] is True
         assert data["last_frame_age_ms"] == 5000

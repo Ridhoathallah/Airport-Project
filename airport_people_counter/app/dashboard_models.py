@@ -14,18 +14,29 @@ from pydantic import BaseModel, ConfigDict
 
 
 class QueueTelemetry(BaseModel):
-    queue: int
+    #: Queue count. ``None`` when no measurement exists (pipeline has not
+    #: produced a reading); never a fabricated zero.
+    queue: Optional[int] = None
     capacity: int
-    occupancy: float
-    congestion_sec: float
-    entry_rate: float
-    exit_rate: float
-    net_change: float
-    trend: Literal["GROWING", "CLEARING", "STEADY"]
-    avg_wait: float
-    longest_wait: float
-    throughput: int
-    state: Literal["NORMAL", "BUSY", "CONGESTED", "BACKLOG"]
+    #: ``None`` when not measured — see ``queue``.
+    occupancy: Optional[float] = None
+    congestion_sec: Optional[float] = None
+    entry_rate: Optional[float] = None
+    exit_rate: Optional[float] = None
+    net_change: Optional[float] = None
+    trend: Optional[Literal["GROWING", "CLEARING", "STEADY"]] = None
+    avg_wait: Optional[float] = None
+    longest_wait: Optional[float] = None
+    throughput: Optional[int] = None
+    #: The backend classifier's own state, passed through unchanged:
+    #: EMPTY / SPARSE / NORMAL / CROWDED / CONGESTED / BACKLOG are the
+    #: detector's vocabulary; UNCONFIGURED means the geometry is not set
+    #: up; DATA_UNAVAILABLE means the pipeline has no queue reading at
+    #: all. The dashboard must not reclassify on its own.
+    state: Literal[
+        "EMPTY", "SPARSE", "NORMAL", "CROWDED", "CONGESTED",
+        "BACKLOG", "UNCONFIGURED", "DATA_UNAVAILABLE",
+    ]
     state_active: bool
     reason: str
     source_state: Optional[str] = None
@@ -35,7 +46,9 @@ class QueueTelemetry(BaseModel):
     predicted_wait: Optional[float] = None
     clearance_time: Optional[float] = None
     service_time_s: Optional[float] = None
-    pacing_status: Optional[str] = "STEADY"
+    #: None when the pipeline did not report a pacing status — never a
+    #: default dressed up as a measurement.
+    pacing_status: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -74,6 +87,12 @@ class CameraTelemetry(BaseModel):
     source_index: Optional[int] = None
     #: Clockwise rotation applied at the capture edge.
     rotation_deg: int = 0
+    #: Camera lifecycle state ("OK" | "RECONNECTING" | "NO_FRAMES" |
+    #: "OFFLINE" | "" unknown) as reported by the capture supervisor.
+    #: Lets the dashboard distinguish "retries in progress" from
+    #: "retries stopped, awaiting manual retry" and from "opened but
+    #: no frames delivered".
+    status: str = ""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -130,12 +149,18 @@ class TrackInfo(BaseModel):
 
 
 class DashboardSnapshot(BaseModel):
+    #: Pipeline availability summary, computed by the backend adapter:
+    #: "ONLINE" | "DEGRADED" | "OFFLINE" | "NO_DATA". This is a
+    #: connectivity/liveness signal only — the queue condition itself
+    #: lives in ``queue.state`` (the classifier's own vocabulary).
     scenario: str
     queue: QueueTelemetry
     system: SystemTelemetry
     camera: CameraTelemetry
     recording: RecordingTelemetry
-    last_known_queue: int
+    #: Last trustworthy queue count, held while the camera is offline so
+    #: the operator keeps context. ``None`` when no reading ever existed.
+    last_known_queue: Optional[int] = None
     last_update: int
     history: List[Sample]
     events: List[EventInfo]

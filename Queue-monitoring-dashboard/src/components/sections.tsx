@@ -1,7 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
-  Eye,
-  EyeOff,
   Camera,
   Clock,
   Activity,
@@ -11,7 +9,7 @@ import {
   Users,
   PencilLine,
 } from "lucide-react";
-import type { Snapshot, QueueEvent } from "../lib/telemetry";
+import type { Snapshot, QueueEvent, Connection } from "../lib/telemetry";
 import { describeEvent } from "../lib/telemetry";
 import type { ConfigResponse } from "../lib/api";
 import { getVideoStreamUrl } from "../lib/api";
@@ -34,6 +32,18 @@ import {
   OccupancyScale,
 } from "../lib/ui";
 import { Sparkline, TimeSeriesChart, type Band, type Series } from "./charts";
+
+/** Per-connectivity copy for the camera panel's offline overlay: says what
+ *  is actually wrong instead of one generic "signal lost". */
+const OFFLINE_COPY: Record<Connection, { title: string; meta: string }> = {
+  LIVE: { title: "No signal", meta: "" },
+  DEGRADED: { title: "No signal", meta: "" },
+  RECONNECTING: { title: "Camera reconnecting", meta: "Retrying automatically" },
+  NO_FRAMES: { title: "No frames received", meta: "The camera opened but stays silent" },
+  CAMERA_OFFLINE: { title: "Signal lost", meta: "Automatic retry stopped" },
+  NO_DATA: { title: "Waiting for pipeline", meta: "No snapshot produced yet" },
+  BACKEND_UNAVAILABLE: { title: "Backend unreachable", meta: "Cannot reach the API" },
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The operator surface.
@@ -65,7 +75,13 @@ export const RANGE_OPTIONS = [
 
 export function QueueStatusPanel({ s }: { s: Snapshot }) {
   const active = s.stateActive;
-  const st = active ? QUEUE_STYLE[s.state] : QUEUE_STYLE.OFFLINE;
+  // Offline with a frozen reading keeps the last condition visible behind
+  // the OFFLINE pill; with no reading ever, the honest answer is "No data".
+  const st = active
+    ? QUEUE_STYLE[s.state]
+    : s.lastKnownQueue !== null
+      ? QUEUE_STYLE.OFFLINE
+      : QUEUE_STYLE.DATA_UNAVAILABLE;
   const critical = active && (s.state === "CONGESTED" || s.state === "BACKLOG");
   const count = active ? s.queue : s.lastKnownQueue;
 
@@ -93,7 +109,7 @@ export function QueueStatusPanel({ s }: { s: Snapshot }) {
           <h2 className="t-title">Queue status</h2>
           <span className="truncate text-[11px] text-text-tertiary">Security Checkpoint A</span>
         </div>
-        {!active && <StatusPill status={QUEUE_STYLE.OFFLINE} />}
+        {!active && <StatusPill status={st} />}
       </header>
 
       <div className="flex flex-col gap-lg px-lg py-lg">
@@ -136,10 +152,12 @@ export function QueueStatusPanel({ s }: { s: Snapshot }) {
             </div>
             {active ? (
               <div className="t-meta mt-1 text-text-secondary">
-                {s.occupancy.toFixed(0)}% of {s.capacity} places
+                {fmtInt(s.occupancy)}% of {s.capacity} places
               </div>
             ) : (
-              <div className="t-meta mt-1 text-text-tertiary">Last update {fmtClock(s.lastUpdate)}</div>
+              <div className="t-meta mt-1 text-text-tertiary">
+                Last update {s.lastUpdate > 0 ? fmtClock(s.lastUpdate) : "never"}
+              </div>
             )}
           </div>
         </div>
@@ -148,11 +166,11 @@ export function QueueStatusPanel({ s }: { s: Snapshot }) {
           <div className="mb-xs flex items-baseline justify-between">
             <span className="t-label text-text-tertiary">Occupancy</span>
             <span className="t-meta text-text-secondary">
-              {active ? `${s.queue} / ${s.capacity}` : "No signal"}
+              {active ? `${fmtInt(s.queue)} / ${s.capacity}` : "No signal"}
             </span>
           </div>
           <OccupancyMeter
-            occupancy={active ? s.occupancy : 0}
+            occupancy={active && s.occupancy !== null ? s.occupancy : 0}
             color={st.color}
             capacity={s.capacity}
             disabled={!active}
@@ -165,7 +183,7 @@ export function QueueStatusPanel({ s }: { s: Snapshot }) {
 
       {/* Tactical Airport Metrics Strip: Trend, Little's Law Prediction, Clearance Time, Screening Pace */}
       <div className="grid shrink-0 grid-cols-2 sm:grid-cols-4 border-t border-border-primary">
-        <StripCell label="Tren Alur">
+        <StripCell label="Flow trend">
           {active ? (
             <span className="flex items-center gap-xs text-[15px] font-semibold" style={{ color: trendColor }}>
               <TrendIcon size={14} aria-hidden />
@@ -175,17 +193,17 @@ export function QueueStatusPanel({ s }: { s: Snapshot }) {
             <span className="text-[15px] font-semibold text-text-tertiary">No signal</span>
           )}
         </StripCell>
-        <StripCell label="Est. Waktu Antrean">
+        <StripCell label="Est. queue wait">
           <span className="t-meta text-[15px] font-semibold text-text-primary">
             {active ? fmtMMSS(s.predictedWait ?? s.avgWait) : "--:--"}
           </span>
         </StripCell>
-        <StripCell label="Waktu Bersih">
+        <StripCell label="Clearance time">
           <span className="t-meta text-[15px] font-semibold text-text-primary">
             {active ? fmtMMSS(s.clearanceTime ?? s.avgWait) : "--:--"}
           </span>
         </StripCell>
-        <StripCell label="Pacing X-Ray">
+        <StripCell label="Screening pace">
           {(() => {
             const pace = s.pacingStatus;
             const paceColor =
@@ -198,18 +216,27 @@ export function QueueStatusPanel({ s }: { s: Snapshot }) {
                     : active
                       ? "var(--text-secondary)"
                       : "var(--text-tertiary)";
-            const paceText =
-              !active
-                ? "No signal"
-                : pace === "IDLE"
-                  ? "Standby"
-                  : pace === "OPTIMAL"
-                    ? `Lancar (${s.serviceTimeS ?? 15}s)`
-                    : pace === "SLOW_INSPECTION"
-                      ? `Teliti (${s.serviceTimeS ?? 35}s)`
-                      : pace === "STAGNANT"
-                        ? "Tertahan (>90s)"
-                        : `Stabil (${s.serviceTimeS ?? 20}s)`;
+            // The word is the pipeline's own pacing status; the seconds are
+            // shown only when the pipeline reported a measured service time.
+            const paceWord =
+              pace === "IDLE"
+                ? "Standby"
+                : pace === "OPTIMAL"
+                  ? "Smooth"
+                  : pace === "SLOW_INSPECTION"
+                    ? "Thorough"
+                    : pace === "STAGNANT"
+                      ? "Stalled"
+                      : pace === "STEADY"
+                        ? "Steady"
+                        : null;
+            const paceText = !active
+              ? "No signal"
+              : paceWord === null
+                ? "—"
+                : s.serviceTimeS != null
+                  ? `${paceWord} (${s.serviceTimeS}s)`
+                  : paceWord;
             return (
               <span className="t-meta text-[15px] font-semibold" style={{ color: paceColor }}>
                 {paceText}
@@ -238,7 +265,7 @@ function StripCell({ label, children }: { label: string; children: React.ReactNo
 export function MetricGrid({ s }: { s: Snapshot }) {
   const h = s.history.slice(-40);
   const active = s.stateActive;
-  const net = s.netChange;
+  const net = typeof s.netChange === "number" ? s.netChange : null;
 
   return (
     <Panel title="Key metrics" icon={<Activity size={14} />} className="shrink-0" bodyClassName="p-md">
@@ -273,8 +300,26 @@ export function MetricGrid({ s }: { s: Snapshot }) {
           label="Net change"
           value={active ? fmtSigned(net) : "--"}
           unit="/min"
-          tone={active ? (net > 0 ? "var(--st-congested)" : net < 0 ? "var(--st-normal)" : undefined) : undefined}
-          footnote={active ? (net > 0 ? "Filling" : net < 0 ? "Clearing" : "Balanced") : undefined}
+          tone={
+            net !== null
+              ? net > 0
+                ? "var(--st-congested)"
+                : net < 0
+                  ? "var(--st-normal)"
+                  : undefined
+              : undefined
+          }
+          footnote={
+            active
+              ? net === null
+                ? undefined
+                : net > 0
+                  ? "Filling"
+                  : net < 0
+                    ? "Clearing"
+                    : "Balanced"
+              : undefined
+          }
         />
       </div>
     </Panel>
@@ -440,11 +485,14 @@ export function WaitingTimePanel({
     >
       <div className="flex shrink-0 items-center justify-between gap-lg px-md pt-md">
         <div className="flex items-baseline gap-lg">
-          <Stat label="Est. Antrean (Little's Law)" value={active ? fmtMMSS(s.predictedWait ?? s.avgWait) : "--:--"} />
-          <Stat label="Rata-rata Berdiri" value={active ? fmtMMSS(s.avgWait) : "--:--"} />
-          <Stat label="Layanan per Pax" value={active ? `${s.serviceTimeS ?? 20}s` : "--"} />
+          <Stat label="Est. wait (Little's Law)" value={active ? fmtMMSS(s.predictedWait ?? s.avgWait) : "--:--"} />
+          <Stat label="Avg. standing wait" value={active ? fmtMMSS(s.avgWait) : "--:--"} />
+          <Stat
+            label="Service per pax"
+            value={active ? (s.serviceTimeS != null ? `${s.serviceTimeS}s` : "—") : "--"}
+          />
         </div>
-        <span className="text-[11px] text-text-tertiary">Histori {range}</span>
+        <span className="text-[11px] text-text-tertiary">History {range}</span>
       </div>
       <div className="min-h-0 flex-1 p-md">
         {active ? (
@@ -486,46 +534,28 @@ function NoSignal() {
 
 export function CameraPanel({
   s,
-  dataSource = "simulator",
   config = null,
   onConfigChanged,
 }: {
   s: Snapshot;
-  dataSource?: "simulator" | "api";
   config?: ConfigResponse | null;
   /** Called after the mapping editor persists geometry, to refresh config. */
   onConfigChanged?: () => void;
 }) {
-  const [show, setShow] = useState({ boxes: true, ids: true, roi: true, line: true });
   const [streamError, setStreamError] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
   const [editing, setEditing] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const [panelSize, setPanelSize] = useState({ w: 0, h: 0 });
 
-  const offline = !s.stateActive;
-  const degraded = s.camera.link === "DEGRADED";
-  const isApi = dataSource === "api";
+  // Feed-level connectivity: DEGRADED still shows the picture (dimmed);
+  // every other non-LIVE connection means there is no usable feed now.
+  const offline = s.connection !== "LIVE" && s.connection !== "DEGRADED";
+  const degraded = s.camera.link === "DEGRADED" || s.connection === "DEGRADED";
   // Calibration needs the real stream plus a config to diff against.
-  const canEdit = isApi && !offline && config !== null;
+  const canEdit = !offline && config !== null;
 
   useEffect(() => {
-    const el = panelRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (entry) {
-        const { width, height } = entry.contentRect;
-        setPanelSize({ w: width, h: height });
-      }
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-
-  useEffect(() => {
-    if (!isApi || !imgRef.current) return;
+    if (!imgRef.current) return;
     const img = imgRef.current;
     img.src = getVideoStreamUrl();
     img.onload = () => setStreamError(false);
@@ -533,42 +563,7 @@ export function CameraPanel({
     return () => {
       img.src = "";
     };
-  }, [isApi, reloadKey]);
-
-  const camW = config?.width ?? 0;
-  const camH = config?.height ?? 0;
-
-  const oc = objectCoverTransform(panelSize.w, panelSize.h, camW, camH);
-
-  const camToPanel = useCallback(
-    (cx: number, cy: number, cw: number = 0, ch: number = 0) => ({
-      left: `${((cx * oc.scaleX + oc.offsetX) / panelSize.w) * 100}%`,
-      top: `${((cy * oc.scaleY + oc.offsetY) / panelSize.h) * 100}%`,
-      width: `${((cw * oc.scaleX) / panelSize.w) * 100}%`,
-      height: `${((ch * oc.scaleY) / panelSize.h) * 100}%`,
-    }),
-    [oc, panelSize],
-  );
-
-  const roiConfigured = config?.roi_configured && config.roi_polygon && config.roi_polygon.length >= 3;
-  const lineConfigured = config?.line_configured && config.counting_line && config.counting_line.length === 2;
-
-  const roiBBox = roiConfigured
-    ? (() => {
-        const pts = config!.roi_polygon!;
-        let minX = Infinity,
-          minY = Infinity,
-          maxX = -Infinity,
-          maxY = -Infinity;
-        for (const [x, y] of pts) {
-          minX = Math.min(minX, x);
-          minY = Math.min(minY, y);
-          maxX = Math.max(maxX, x);
-          maxY = Math.max(maxY, y);
-        }
-        return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
-      })()
-    : null;
+  }, [reloadKey]);
 
   return (
     <Panel
@@ -587,35 +582,9 @@ export function CameraPanel({
               <PencilLine size={13} /> Edit mapping
             </button>
           )}
-          {!isApi && (
-            <div className="flex items-center gap-xs">
-              <OverlayToggle
-                on={show.boxes}
-                label="People"
-                icon={show.boxes ? <Eye size={13} /> : <EyeOff size={13} />}
-                onClick={() => setShow((v) => ({ ...v, boxes: !v.boxes }))}
-              />
-              <OverlayToggle
-                on={show.ids}
-                label="Ids"
-                icon={show.ids ? <Eye size={13} /> : <EyeOff size={13} />}
-                onClick={() => setShow((v) => ({ ...v, ids: !v.ids }))}
-              />
-              <OverlayToggle
-                on={show.roi}
-                label="Queue area"
-                icon={show.roi ? <Eye size={13} /> : <EyeOff size={13} />}
-                onClick={() => setShow((v) => ({ ...v, roi: !v.roi }))}
-              />
-              <OverlayToggle
-                on={show.line}
-                label="Counting line"
-                icon={show.line ? <Eye size={13} /> : <EyeOff size={13} />}
-                onClick={() => setShow((v) => ({ ...v, line: !v.line }))}
-              />
-            </div>
-          )}
-          <span className="t-meta text-text-tertiary">{offline ? 0 : s.camera.fps} fps</span>
+          <span className="t-meta text-text-tertiary">
+            {!offline && s.camera.fps > 0 ? `${s.camera.fps} fps` : "—"}
+          </span>
           <StatusPill
             status={
               offline ? QUEUE_STYLE.OFFLINE : degraded ? healthStyle("DEGRADED") : healthStyle("ONLINE")
@@ -626,105 +595,31 @@ export function CameraPanel({
       className="h-[300px] shrink-0 min-h-0 xl:h-auto xl:flex-1"
       bodyClassName="flex flex-col"
     >
-      <div ref={panelRef} className="relative min-h-0 flex-1 overflow-hidden bg-black">
-        {isApi ? (
-          <img
-            key={reloadKey}
-            ref={imgRef}
-            className="absolute inset-0 h-full w-full object-cover"
-            alt="Live camera feed of the security screening queue"
-            style={{
-              filter: offline
-                ? "grayscale(1) brightness(0.35)"
-                : degraded
-                  ? "brightness(0.85) contrast(0.95)"
-                  : "none",
-              opacity: streamError ? 0.25 : 1,
-            }}
-          />
-        ) : (
-          !offline && (
-            <div
-              className="absolute inset-0"
-              style={{
-                background: "linear-gradient(180deg, #18202c 0%, #101620 55%, #0a0d13 100%)",
-                filter: degraded
-                  ? "brightness(0.85) contrast(0.95)"
-                  : "none",
-              }}
-            />
-          )
-        )}
-
-        {/* Simulated geometry, so the simulator shows what the detector would. */}
-        {!offline && !isApi && (
-          <>
-            {show.roi && roiBBox && (
-              <div className="absolute" style={camToPanel(roiBBox.x, roiBBox.y, roiBBox.w, roiBBox.h)}>
-                <div
-                  className="h-full w-full border border-dashed"
-                  style={{ borderColor: "color-mix(in srgb, var(--st-busy) 60%, transparent)" }}
-                />
-                <span
-                  className="absolute -top-4 left-0 text-[9px] font-semibold tracking-wide"
-                  style={{ color: "var(--st-busy)" }}
-                >
-                  Queue area
-                </span>
-              </div>
-            )}
-            {show.line && lineConfigured && (() => {
-              const [[lx1, ly1], [lx2, ly2]] = config!.counting_line!;
-              return (
-                <div
-                  className="absolute border-t border-dashed"
-                  style={{
-                    ...camToPanel(Math.min(lx1, lx2), Math.min(ly1, ly2), Math.abs(lx2 - lx1), 0),
-                    borderColor: "color-mix(in srgb, var(--st-busy) 60%, transparent)",
-                  }}
-                />
-              );
-            })()}
-            {show.boxes &&
-              s.tracks.map((t) => (
-                <div
-                  key={t.id}
-                  className="absolute border"
-                  style={{
-                    left: `${t.x * 100}%`,
-                    top: `${t.y * 100}%`,
-                    width: `${t.w * 100}%`,
-                    height: `${t.h * 100}%`,
-                    borderColor: t.inRoi
-                      ? "color-mix(in srgb, var(--chart-queue) 70%, transparent)"
-                      : "color-mix(in srgb, var(--text-tertiary) 70%, transparent)",
-                    borderWidth: 1,
-                  }}
-                >
-                  {show.ids && (
-                    <span
-                      className="tnum absolute -top-3.5 left-0 text-[9px]"
-                      style={{ color: t.inRoi ? "var(--chart-queue)" : "var(--text-tertiary)" }}
-                    >
-                      {t.id}
-                    </span>
-                  )}
-                </div>
-              ))}
-          </>
-        )}
+      <div className="relative min-h-0 flex-1 overflow-hidden bg-black">
+        <img
+          key={reloadKey}
+          ref={imgRef}
+          className="absolute inset-0 h-full w-full object-cover"
+          alt="Live camera feed of the security screening queue"
+          style={{
+            filter: offline
+              ? "grayscale(1) brightness(0.35)"
+              : degraded
+                ? "brightness(0.85) contrast(0.95)"
+                : "none",
+            opacity: streamError ? 0.25 : 1,
+          }}
+        />
 
         {/* CCTV chrome. The checkpoint name is not repeated here: the queue
             status panel above already names it, and a second copy collides
             with the detector's own queue-area caption. */}
         <div className="pointer-events-none absolute left-3 top-2.5 flex flex-col gap-1">
-          {/* Camera chrome follows the pipeline's running source; the
-              fallback keeps older server builds readable. */}
-          <span className="text-[11px] font-semibold text-white/85">
-            {s.camera.sourceLabel && s.camera.sourceLabel.trim() !== ""
-              ? s.camera.sourceLabel
-              : "CAM-01"}
-          </span>
+          {/* Camera chrome follows the pipeline's running source. When the
+              pipeline never reported one, no identifier is invented here. */}
+          {s.camera.sourceLabel && s.camera.sourceLabel.trim() !== "" && (
+            <span className="text-[11px] font-semibold text-white/85">{s.camera.sourceLabel}</span>
+          )}
           {degraded && !offline && (
             <span
               className="w-max rounded-corner-xs px-1 py-0.5 text-[10px] font-semibold"
@@ -740,22 +635,21 @@ export function CameraPanel({
 
         {!offline && (
           <div className="pointer-events-none absolute right-2.5 top-2.5 flex items-center gap-1.5">
-            {/* Simulator output is a generated scene, not a camera: it gets a
-                steady neutral marker and a different word. Only a real feed
-                gets the pulsing live dot. */}
             <span
-              className={`h-1.5 w-1.5 rounded-full ${isApi ? "live-dot" : ""}`}
-              style={{ background: isApi ? "var(--st-backlog)" : "var(--st-offline)" }}
+              className="h-1.5 w-1.5 rounded-full live-dot"
+              style={{ background: "var(--st-backlog)" }}
             />
-            <span className="text-[10px] font-semibold tracking-widest text-white/80">
-              {isApi ? "LIVE" : "DEMO"}
-            </span>
+            <span className="text-[10px] font-semibold tracking-widest text-white/80">LIVE</span>
           </div>
         )}
 
-        <div className="tnum pointer-events-none absolute bottom-1.5 left-2.5 text-[11px] text-white/60">
-          {fmtClock(s.frameTs)}
-        </div>
+        {/* Frame clock only when a frame actually arrived: with no frame
+            there is no time to show, and an epoch-rendered 0 would lie. */}
+        {s.frameTs > 0 && (
+          <div className="tnum pointer-events-none absolute bottom-1.5 left-2.5 text-[11px] text-white/60">
+            {fmtClock(s.frameTs)}
+          </div>
+        )}
         <div className="tnum pointer-events-none absolute bottom-1.5 right-2.5 text-[11px] text-white/45">
           {s.camera.resolution}
         </div>
@@ -763,14 +657,20 @@ export function CameraPanel({
         {offline && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-sm bg-black/55">
             <StatusMark status={QUEUE_STYLE.OFFLINE} size={22} />
-            <span className="t-title text-text-secondary">Signal lost</span>
-            <span className="t-meta text-text-tertiary">Last frame {fmtClock(s.lastUpdate)}</span>
+            <span className="t-title text-text-secondary">{OFFLINE_COPY[s.connection].title}</span>
+            <span className="t-meta text-text-tertiary">
+              {s.lastUpdate > 0 ? `Last frame ${fmtClock(s.lastUpdate)}` : OFFLINE_COPY[s.connection].meta}
+            </span>
+            {s.connection === "CAMERA_OFFLINE" && (
+              <span className="t-meta text-text-tertiary">
+                Select a camera source in diagnostics to retry
+              </span>
+            )}
           </div>
         )}
 
-        {/* Only meaningful when a real stream is expected: the simulator
-            draws its own scene and has no stream to interrupt. */}
-        {streamError && !offline && isApi && (
+        {/* Only meaningful when a live connection is expected. */}
+        {streamError && !offline && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-sm bg-black/70">
             <StatusMark status={healthStyle("DEGRADED")} size={22} />
             <span className="t-title text-text-secondary">Camera stream interrupted</span>
@@ -792,65 +692,6 @@ export function CameraPanel({
       </div>
     </Panel>
   );
-}
-
-function OverlayToggle({
-  on,
-  label,
-  icon,
-  onClick,
-}: {
-  on: boolean;
-  label: string;
-  icon: React.ReactNode;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      className="ctl h-6 px-1.5"
-      data-active={on}
-      aria-pressed={on}
-      aria-label={`${label} overlay`}
-      title={`${label} overlay`}
-      onClick={onClick}
-    >
-      {icon}
-    </button>
-  );
-}
-
-/**
- * Compute CSS overlays that account for object-cover rendering.
- *
- * object-cover fills the container while maintaining aspect ratio, cropping
- * overflow equally from both sides. The returned {left,top,width,height}%
- * values place an overlay at the correct position within the container so
- * it aligns with the underlying camera image.
- */
-function objectCoverTransform(containerW: number, containerH: number, camW: number, camH: number) {
-  if (containerW <= 0 || containerH <= 0 || camW <= 0 || camH <= 0) {
-    return { offsetX: 0, offsetY: 0, scaleX: 1, scaleY: 1 };
-  }
-  const imgAspect = camW / camH;
-  const panelAspect = containerW / containerH;
-  let renderedW: number;
-  let renderedH: number;
-  if (panelAspect > imgAspect) {
-    renderedW = containerH * imgAspect;
-    renderedH = containerH;
-  } else {
-    renderedW = containerW;
-    renderedH = containerW / imgAspect;
-  }
-  const offsetX = (containerW - renderedW) / 2;
-  const offsetY = (containerH - renderedH) / 2;
-  return {
-    offsetX,
-    offsetY,
-    scaleX: renderedW / camW,
-    scaleY: renderedH / camH,
-  };
 }
 
 // ── Recent activity ─────────────────────────────────────────────────────────

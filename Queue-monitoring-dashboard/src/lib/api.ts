@@ -1,4 +1,13 @@
-export type QueueState = "NORMAL" | "BUSY" | "CONGESTED" | "BACKLOG";
+/** The backend classifier's own vocabulary (pass-through). */
+export type QueueState =
+  | "EMPTY"
+  | "SPARSE"
+  | "NORMAL"
+  | "CROWDED"
+  | "CONGESTED"
+  | "BACKLOG"
+  | "UNCONFIGURED"
+  | "DATA_UNAVAILABLE";
 
 export interface TrackInfo {
   id: number;
@@ -25,26 +34,33 @@ export interface EventInfo {
 }
 
 export interface QueueTelemetry {
-  queue: number;
+  /** null when no measurement exists — never a fabricated zero. */
+  queue: number | null;
   capacity: number;
-  occupancy: number;
-  congestion_sec: number;
-  entry_rate: number;
-  exit_rate: number;
-  net_change: number;
-  trend: "GROWING" | "CLEARING" | "STEADY";
-  avg_wait: number;
-  longest_wait: number;
-  throughput: number;
+  /** null when not measured. */
+  occupancy: number | null;
+  congestion_sec: number | null;
+  entry_rate: number | null;
+  exit_rate: number | null;
+  net_change: number | null;
+  trend: "GROWING" | "CLEARING" | "STEADY" | null;
+  avg_wait: number | null;
+  longest_wait: number | null;
+  throughput: number | null;
+  /** Classifier state, passed through unchanged by the backend. */
   state: QueueState;
   state_active: boolean;
   reason: string;
   /** Operational guidance for the current condition. */
-  action?: string;
-  predicted_wait?: number;
-  clearance_time?: number;
-  service_time_s?: number;
-  pacing_status?: "OPTIMAL" | "STEADY" | "SLOW_INSPECTION" | "STAGNANT" | "IDLE";
+  action?: string | null;
+  /** Minutes; null when the estimator has no output. */
+  predicted_wait?: number | null;
+  /** Minutes; null when not computed. */
+  clearance_time?: number | null;
+  /** Seconds per passenger; null when not measured. */
+  service_time_s?: number | null;
+  /** null when the pipeline reported no pacing status. */
+  pacing_status?: "OPTIMAL" | "STEADY" | "SLOW_INSPECTION" | "STAGNANT" | "IDLE" | null;
 }
 
 export interface SystemTelemetry {
@@ -62,6 +78,13 @@ export interface SystemTelemetry {
 
 export interface CameraTelemetry {
   link: "ONLINE" | "OFFLINE" | "DEGRADED";
+  /**
+   * Camera lifecycle state from the capture supervisor:
+   * "OK" | "RECONNECTING" | "NO_FRAMES" | "OFFLINE" | "" (not reported).
+   * Lets the console tell "retries in progress" from "retries stopped"
+   * and from "opened but delivering no frames".
+   */
+  status: string;
   fps: number;
   resolution: string;
   /** null when the pipeline does not measure it -- not a zero. */
@@ -70,7 +93,7 @@ export interface CameraTelemetry {
   packet_loss: number | null;
   last_frame_age_ms: number;
   uptime_sec: number;
-  /** Camera chrome label reported by the pipeline, e.g. "CAM-01". */
+  /** Camera chrome label reported by the pipeline ("" = not reported). */
   source_label: string;
   /** Live webcam index; null for file/IP/image sources. */
   source_index: number | null;
@@ -87,12 +110,15 @@ export interface RecordingTelemetry {
 }
 
 export interface SnapshotResponse {
+  /** Pipeline availability summary: "ONLINE" | "DEGRADED" | "OFFLINE" | "NO_DATA". */
   scenario: string;
   queue: QueueTelemetry;
   system: SystemTelemetry;
   camera: CameraTelemetry;
   recording: RecordingTelemetry;
-  last_known_queue: number;
+  /** Last trustworthy queue count; null when none ever existed. */
+  last_known_queue: number | null;
+  /** Epoch ms of the newest frame the analytics saw (0 = never). */
   last_update: number;
   history: Array<{
     t: number;
@@ -273,18 +299,6 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
     throw new Error(`API error ${res.status}: ${res.statusText}`);
   }
   return res.json();
-}
-
-export function isOnline(snapshot: SnapshotResponse | null): boolean {
-  return snapshot !== null && snapshot.camera.link === "ONLINE";
-}
-
-export function isDegraded(snapshot: SnapshotResponse | null): boolean {
-  return snapshot !== null && snapshot.camera.link === "DEGRADED";
-}
-
-export function isOffline(snapshot: SnapshotResponse | null): boolean {
-  return snapshot === null || snapshot.camera.link === "OFFLINE";
 }
 
 export async function shutdownApi(): Promise<void> {

@@ -59,6 +59,11 @@ class CameraState:
     source_index: Optional[int] = None
     #: Clockwise rotation applied at the capture edge.
     rotation_deg: int = 0
+    #: Camera lifecycle state from the capture supervisor:
+    #: "OK" | "RECONNECTING" | "NO_FRAMES" | "OFFLINE" | "" (unknown).
+    #: Lets the dashboard tell "camera lost, retrying" apart from
+    #: "source opened but delivering no frames".
+    status: str = ""
 
 
 @dataclass(frozen=True)
@@ -103,7 +108,12 @@ class QueueSnapshot:
     people_in_queue: int
     total_in: int
     total_out: int
-    queue_state: Literal["NORMAL", "BUSY", "CONGESTED", "BACKLOG", "DATA_UNAVAILABLE"]
+    #: The classifier's own vocabulary, passed through as-is (BUSY is a
+    #: legacy alias the adapter normalises to CROWDED before the wire).
+    queue_state: Literal[
+        "EMPTY", "SPARSE", "NORMAL", "CROWDED", "CONGESTED",
+        "BACKLOG", "UNCONFIGURED", "DATA_UNAVAILABLE",
+    ]
     occupancy_percent: float
     entry_rate: float
     exit_rate: float
@@ -119,6 +129,11 @@ class QueueSnapshot:
     events: List[Event] = field(default_factory=list)
     #: Compute device the inference ran on ("mps", "cpu", "cuda:0", ...).
     device: str = ""
+    #: Epoch seconds of the newest frame the analytics actually saw
+    #: (0 = no frame yet). The dashboard's "last update" is derived from
+    #: this, so an offline pipeline never presents its own snapshot
+    #: timestamp as the age of the newest queue reading.
+    last_frame_unix: float = 0.0
     predicted_wait_s: float = 0.0
     clearance_time_s: float = 0.0
     service_time_s: float = 0.0
@@ -139,6 +154,11 @@ class SnapshotBuilder:
         OFFLINE.
         """
         if system.capture_fps == 0:
+            # No frames flowing. If a frame ever arrived, report its real
+            # age; only "never produced a frame" carries the sentinel.
+            if system.last_frame_unix > 0:
+                staleness = max(0.0, (time.time() - system.last_frame_unix) * 1000)
+                return "OFFLINE", int(staleness)
             return "OFFLINE", 999999
         expected_interval_ms = 1000 / system.capture_fps
         if system.last_frame_unix > 0:
@@ -167,6 +187,13 @@ class SnapshotBuilder:
         else:
             resolution = f"{config.width or '?'}x{config.height or '?'}"
 
+        # Camera lifecycle state as reported by the capture supervisor.
+        # Never fabricated: an empty/unexpected value falls back to a
+        # link-derived default rather than claiming "OK".
+        status = getattr(system, "camera_status", "")
+        if not isinstance(status, str) or status not in ("OK", "RECONNECTING", "NO_FRAMES", "OFFLINE"):
+            status = {"ONLINE": "OK", "DEGRADED": "OK"}.get(link, "OFFLINE")
+
         return CameraState(
             link=link,
             fps=system.capture_fps,
@@ -175,6 +202,7 @@ class SnapshotBuilder:
             source_label=system.source_label,
             source_index=system.source_index,
             rotation_deg=system.rotation_deg,
+            status=status,
         )
 
     @staticmethod
@@ -382,5 +410,68 @@ class SnapshotBuilder:
             camera_state=cls._camera_state(s, camera_config),
             tracks=cls._tracks_to_api(tracks, camera_config),
             events=cls._events_to_api(recent_events),
+            last_frame_unix=s.last_frame_unix,
         )
         return snap, annotated_frame
+
+    @classmethod
+    def build_offline(
+        cls,
+        camera_config: CameraConfig,
+        system: SystemMetrics,
+        recent_events: Optional[List[dict]] = None,
+    ) -> QueueSnapshot:
+        """Snapshot for a pipeline that has no live queue reading.
+
+        Published by the detection loop while the camera is unavailable
+        (startup failure, reconnecting, retries exhausted) so the API can
+        report the camera state honestly. Queue metrics are zero-valued
+        *unavailable* markers: the dashboard adapter turns them into
+        explicit nulls, never into a fabricated queue reading. The camera
+        block carries the real lifecycle state and the age of the last
+        frame that did arrive.
+        """
+        last_frame_unix = float(getattr(system, "last_frame_unix", 0.0) or 0.0)
+        now = time.time()
+        if last_frame_unix > 0:
+            staleness = max(0, int((now - last_frame_unix) * 1000))
+        else:
+            staleness = 999999
+
+        snap = QueueSnapshot(
+            timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            frame_id=int(system.frame_count),
+            freshness="OFFLINE",
+            staleness_ms=staleness,
+            fps=0.0,
+            inference_ms=0.0,
+            tracking_ms=0.0,
+            analytics_ms=0.0,
+            detection_count=0,
+            tracked_people=0,
+            people_in_queue=0,
+            total_in=0,
+            total_out=0,
+            device=system.device,
+            queue_state="DATA_UNAVAILABLE",
+            occupancy_percent=0.0,
+            entry_rate=0.0,
+            exit_rate=0.0,
+            avg_wait_s=0.0,
+            longest_wait_s=0.0,
+            congestion_duration_s=0.0,
+            spacing_px=None,
+            movement="IDLE",
+            config_status=ConfigStatus(
+                roi_configured=camera_config.roi_configured,
+                line_configured=camera_config.line_configured,
+                calibrated=camera_config.calibrated,
+                classifier_enabled=camera_config.roi_configured,
+            ),
+            calibration="METRES" if camera_config.calibrated else "PX ONLY",
+            camera_state=cls._camera_state(system, camera_config),
+            tracks=[],
+            events=cls._events_to_api(recent_events or []),
+            last_frame_unix=last_frame_unix,
+        )
+        return snap

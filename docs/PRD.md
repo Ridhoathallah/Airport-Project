@@ -56,7 +56,7 @@ repository does not contain. Where the project has pre-defined its own gates
 | SM-01 | Counting accuracy vs ground truth | `scripts/evaluate_counts.py` on ≥30 min representative footage, ≥50 labelled intervals: MAE, ±1/±2 accuracy, bias, coverage | Defined gates: MAE < 1.0, ±1 > 85%, ±2 > 95%, \|bias\| < 0.5, coverage ≥ 80% | **TBD — never measured on real airport footage** |
 | SM-02 | Time for an operator to answer the core situational questions | Usable-test with operators | Design goal: 3–5 s (from the dashboard design brief); not user-tested | **TBD** |
 | SM-03 | Pipeline real-time headroom | Sustained FPS and inference ms at the deployed resolution | ≥ 15 FPS sustained; inference ≈ 27 ms/frame on MPS was reported in earlier runs (indicative, not continuously measured) | **TBD baseline** |
-| SM-04 | Regression safety | Test suites pass on every change | 100% of `make test` (265 unittest) + `pytest` (310) + `pnpm test` (30) green | **Implemented (measured 2026-10-22)** |
+| SM-04 | Regression safety | Test suites pass on every change | 100% of `make test` (308 unittest) + `pytest` (358) + `pnpm test` (40) green | **Implemented (measured 2026-10-23)** |
 
 ## 5. Target Users & Needs
 
@@ -89,7 +89,8 @@ repository does not contain. Where the project has pre-defined its own gates
 ### In scope
 Camera/video/RTSP input, person detection & tracking, queue ROI + directional
 IN/OUT line analytics, rule-based state classification, event logging, local
-FastAPI service, React operator dashboard (live + demo modes), interactive
+FastAPI service, React operator dashboard (presentation only; the backend
+is the single source of truth), interactive
 mapping calibration with hot reload, offline evaluation tooling, dataset/ML
 tooling for a future custom model.
 
@@ -184,8 +185,10 @@ Format: **FR-ID — requirement — Status**. Related AC in §10.
 - **FR-23** — History: 1 Hz samples kept 60 minutes (3600), returned evenly
   downsampled (`?points=2..3600`, default 240). — **Implemented**
   (`snapshot_buffer.py`, `GET /api/dashboard/history`).
-- **FR-24** — Dashboard renders live mode (API) and demo mode (simulator with
-  scenario switch), switchable at runtime. — **Implemented**
+- **FR-24** — Dashboard renders backend telemetry only: no synthetic data
+  source, no scenario switch. Connectivity (backend unreachable / camera
+  offline / no frames) is presented separately from the queue condition,
+  which is always the backend classifier's answer. — **Implemented**
   (`telemetry.ts`, `App.tsx`).
 - **FR-25** — Operator-facing event wording is plain language; technical
   wording reserved for diagnostics (`label`/`detail` vs `technical`). —
@@ -217,6 +220,26 @@ Format: **FR-ID — requirement — Status**. Related AC in §10.
   code + `models/face_detection_yunet_2023mar.onnx` present, default disabled
   (`--face` opt-in), not covered by the mapping-era test suites.
 
+### Camera resilience & console presentation
+- **FR-34** — A camera that fails to open or stops delivering frames must not
+  stop the FastAPI service: the capture supervisor retries with bounded
+  backoff (up to 5 attempts, waits 1/2/4/8 s between them), then stops and
+  waits for a manual source selection (re-selecting a source while offline
+  restarts the sequence). The snapshot reports `camera.status`
+  (`OK`/`RECONNECTING`/`NO_FRAMES`/`OFFLINE`) and the real age of the last
+  frame. — **Implemented** (`_open_live_stream` + loop supervisor in
+  `detect_people.py`; `test_camera_controls.py`, `test_dashboard_adapter.py`).
+- **FR-35** — Availability is never confused with classification: `scenario`
+  summarises pipeline availability (`ONLINE`/`DEGRADED`/`OFFLINE`/`NO_DATA`),
+  `queue.state` passes the classifier vocabulary through unchanged, and a
+  measurement without a reading is `null` on the wire (never a fabricated
+  zero; `0` appears only when a reading exists). — **Implemented**
+  (`dashboard_adapter.py`, `telemetry.ts`; `telemetry.test.ts`).
+- **FR-36** — Dashboard theme: dark by default, persistent light/dark toggle
+  that survives reloads without a page reload, tokens applied everywhere. —
+  **Implemented** (`:root.light` in `index.css`, toggle in `App.tsx`,
+  no-flash script in `index.html`).
+
 ## 9. Non-Functional Requirements
 
 | ID | Requirement | Status |
@@ -226,7 +249,7 @@ Format: **FR-ID — requirement — Status**. Related AC in §10.
 | NFR-03 | Real-time: keep up with camera pace; expose measured FPS/timings | **Implemented** (per-frame timings + end-of-run summary) |
 | NFR-04 | Crash-safe configuration: atomic writes, invalid input never replaces good config | **Implemented** (`save_mapping` + PUT ordering) |
 | NFR-05 | Thread-safe snapshot handoff between pipeline and API | **Implemented** (`SnapshotHolder` lock) |
-| NFR-06 | Deterministic, camera-free test suite for analytics | **Implemented** (265/310 tests, no hardware needed) |
+| NFR-06 | Deterministic, camera-free test suite for analytics | **Implemented** (308 unittest + 358 pytest, no hardware needed) |
 | NFR-07 | Honest freshness: dashboard shows LIVE/STALE/OFFLINE from data age, not hope | **Implemented** (`freshness`, `last_frame_age_ms`; camera `NO SIGNAL` in launcher) |
 | NFR-08 | Documentation follows code; claims require evidence | **Implemented as a process rule** (this PRD + `AGENTS.md`) |
 
@@ -261,7 +284,8 @@ Format: **FR-ID — requirement — Status**. Related AC in §10.
   CSV, When the evaluator runs, Then it reports MAE/±1/±2/bias/coverage and
   exits 0/1/2 per data sufficiency. *Evidence: `test_evaluate_counts.py`.*
 - **AC-08 (G-05)** — Given any code change, When `make test`, `pytest`, and
-  `pnpm test` run, Then all pass. *Evidence: 2026-10-22 runs — 265 / 310 / 30.*
+  `pnpm test` run, Then all pass. *Evidence: 2026-10-23 runs — `make test`:
+  308 (unittest) + 358 (pytest); `pnpm test`: 40.*
 
 ## 11. Feature Implementation Status (summary)
 
@@ -273,7 +297,9 @@ Format: **FR-ID — requirement — Status**. Related AC in §10.
 | Occupancy / flow / waiting / movement / congestion | Implemented | `test_queue_prototype.py` |
 | Classifier EMPTY→CONGESTED | Implemented | config thresholds + tests |
 | BACKLOG state | Partial (disabled: no flow baseline) | `baseline_people_per_minute: null` |
-| Dashboard live + demo modes, charts, events, diagnostics | Implemented | build + browser verification |
+| Dashboard (API-only: charts, events, diagnostics, themes) | Implemented | build + browser verification |
+| Camera failure resilience (bounded reconnect, API stays up) | Implemented | supervisor logic + `test_camera_controls.py` / `test_dashboard_adapter.py` |
+| Honest availability states (nulls; connectivity vs condition) | Implemented | adapter tests + `telemetry.test.ts` |
 | Mapping raw stream `?annotated=0`, annotated default | Implemented | live stream byte checks |
 | History buffer (60 min @1 Hz) | Implemented | `snapshot_buffer.py` |
 | Offline evaluator | Implemented | `test_evaluate_counts.py` |
@@ -309,3 +335,5 @@ Format: **FR-ID — requirement — Status**. Related AC in §10.
    a multi-lane UI is undecided.
 5. **Custom model** — whether to invest in fine-tuning (tooling ready,
    FR-31) depends on the accuracy gap measured in (1).
+
+

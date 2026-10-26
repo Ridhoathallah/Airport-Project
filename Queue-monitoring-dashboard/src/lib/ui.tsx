@@ -30,14 +30,31 @@ export interface StatusStyle {
   description?: string;
 }
 
+/**
+ * The classifier vocabulary as the operator reads it. The state itself is
+ * always the backend's answer — this table only dresses it in console
+ * language, it never decides a condition.
+ */
 export const QUEUE_STYLE: Record<StatusKey, StatusStyle> = {
+  EMPTY: {
+    color: "var(--st-normal)",
+    label: "Empty",
+    glyph: "circle",
+    description: "Queue clear: no passengers waiting.",
+  },
+  SPARSE: {
+    color: "var(--st-normal)",
+    label: "Quiet",
+    glyph: "diamond",
+    description: "Queue nearly empty: flow well within capacity.",
+  },
   NORMAL: {
     color: "var(--st-normal)",
     label: "Normal",
     glyph: "circle",
     description: "Queue within normal operating range.",
   },
-  BUSY: {
+  CROWDED: {
     color: "var(--st-busy)",
     label: "Busy",
     glyph: "diamond",
@@ -54,6 +71,18 @@ export const QUEUE_STYLE: Record<StatusKey, StatusStyle> = {
     label: "Backlog",
     glyph: "square",
     description: "Queue exceeds normal operating conditions. Action required.",
+  },
+  UNCONFIGURED: {
+    color: "var(--st-offline)",
+    label: "Setup incomplete",
+    glyph: "ring",
+    description: "Queue geometry not configured: analytics unavailable.",
+  },
+  DATA_UNAVAILABLE: {
+    color: "var(--st-offline)",
+    label: "No data",
+    glyph: "ring",
+    description: "No queue reading available.",
   },
   DEGRADED: {
     color: "var(--st-busy)",
@@ -98,30 +127,31 @@ export function healthStyle(s: PipelineStatus | LinkStatus): StatusStyle {
 }
 
 // ── Occupancy ladder ────────────────────────────────────────────────────────
-// Mirrors the live classifier in config/camera.yaml. One source of truth for
-// the meter, the chart threshold bands and the severity colouring.
+// Mirrors the classifier's own thresholds in config/camera.yaml. Display
+// markers only: the queue condition itself always comes from the backend's
+// state, never from a percentage re-bucketed here.
 export const OCCUPANCY_LADDER = [
-  { pct: 60, key: "BUSY" as QueueState, label: "Busy" },
-  { pct: 80, key: "CONGESTED" as QueueState, label: "Congested" },
+  { pct: 60, label: "Busy" },
+  { pct: 80, label: "Congested" },
 ];
-
-/** The status colour for a given occupancy percentage. */
-export function occupancyStatus(occupancy: number): StatusStyle {
-  if (occupancy >= 100) return QUEUE_STYLE.BACKLOG;
-  if (occupancy >= 80) return QUEUE_STYLE.CONGESTED;
-  if (occupancy >= 60) return QUEUE_STYLE.BUSY;
-  return QUEUE_STYLE.NORMAL;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Formatting
+//
+// Every formatter is null-safe: a measurement that does not exist renders
+// as an em-free "—", never as a fabricated 0.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const fmtInt = (n: number) => Math.round(n).toLocaleString("en-US");
-export const fmt1 = (n: number) => n.toFixed(1);
+const isNum = (n: number | null | undefined): n is number =>
+  typeof n === "number" && !Number.isNaN(n);
+
+export const fmtInt = (n: number | null | undefined) =>
+  isNum(n) ? Math.round(n).toLocaleString("en-US") : "—";
+export const fmt1 = (n: number | null | undefined) => (isNum(n) ? n.toFixed(1) : "—");
 
 /** Minutes → mm:ss, so a wait reads like a clock on the wall. */
-export function fmtMMSS(min: number) {
+export function fmtMMSS(min: number | null | undefined) {
+  if (!isNum(min)) return "—";
   const total = Math.max(0, Math.round(min * 60));
   const m = Math.floor(total / 60);
   const s = total % 60;
@@ -129,10 +159,12 @@ export function fmtMMSS(min: number) {
 }
 
 export function fmtClock(ms: number) {
+  if (!isNum(ms) || ms <= 0) return "—";
   return new Date(ms).toLocaleTimeString("en-GB", { hour12: false });
 }
 
-export function fmtDuration(sec: number) {
+export function fmtDuration(sec: number | null | undefined) {
+  if (!isNum(sec)) return "—";
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
   const s = Math.floor(sec % 60);
@@ -142,6 +174,7 @@ export function fmtDuration(sec: number) {
 }
 
 export function fmtAgo(ms: number, now: number) {
+  if (!isNum(ms) || ms <= 0) return "—";
   const s = Math.max(0, Math.round((now - ms) / 1000));
   if (s < 60) return `${s}s ago`;
   const m = Math.floor(s / 60);
@@ -149,7 +182,8 @@ export function fmtAgo(ms: number, now: number) {
 }
 
 /** Signed rate, so "+4" and "-2" read as direction at a glance. */
-export function fmtSigned(n: number, digits = 1) {
+export function fmtSigned(n: number | null | undefined, digits = 1) {
+  if (!isNum(n)) return "—";
   const v = digits === 0 ? Math.round(n) : Number(n.toFixed(digits));
   return `${v > 0 ? "+" : ""}${v}`;
 }

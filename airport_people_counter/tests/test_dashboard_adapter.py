@@ -12,11 +12,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'app'))
 from dashboard_adapter import (
     build_dashboard_snapshot,
     reset_adapter_state,
-    _map_cv_state_to_ui,
+    _queue_state,
     _cv_state_is_unconfigured,
     _compute_trend,
     _reason_for,
     _derive_system_status,
+    _component_statuses,
 )
 from dashboard_models import (
     DashboardSnapshot,
@@ -106,17 +107,16 @@ class MockCameraConfig:
         self.queue_capacity = queue_capacity
 
 
-def test_map_cv_state_to_ui():
-    """Test CV state to UI state mapping."""
-    assert _map_cv_state_to_ui("EMPTY") == "NORMAL"
-    assert _map_cv_state_to_ui("SPARSE") == "NORMAL"
-    assert _map_cv_state_to_ui("NORMAL") == "NORMAL"
-    assert _map_cv_state_to_ui("CROWDED") == "BUSY"
-    assert _map_cv_state_to_ui("CONGESTED") == "CONGESTED"
-    assert _map_cv_state_to_ui("BACKLOG") == "BACKLOG"
-    assert _map_cv_state_to_ui("UNCONFIGURED") == "NORMAL"
-    assert _map_cv_state_to_ui("DATA_UNAVAILABLE") == "NORMAL"
-    assert _map_cv_state_to_ui("UNKNOWN") == "NORMAL"
+def test_queue_state_passthrough():
+    """Classifier states pass through the adapter unchanged."""
+    for state in ("EMPTY", "SPARSE", "NORMAL", "CROWDED", "CONGESTED",
+                  "BACKLOG", "UNCONFIGURED", "DATA_UNAVAILABLE"):
+        assert _queue_state(state) == state
+    # Legacy alias only — never a re-bucketing of a live state.
+    assert _queue_state("BUSY") == "CROWDED"
+    # Unknown / missing degrades to explicit unavailability, not a condition.
+    assert _queue_state("UNKNOWN") == "DATA_UNAVAILABLE"
+    assert _queue_state(None) == "DATA_UNAVAILABLE"
 
 
 def test_cv_state_is_unconfigured():
@@ -138,14 +138,20 @@ def test_compute_trend():
 
 
 def test_reason_for():
-    """Test reason text generation."""
+    """Test reason text generation (classifier vocabulary, None-safe)."""
     assert "exceeds capacity" in _reason_for("BACKLOG", 1.0, 95.0)
     assert "above 80%" in _reason_for("CONGESTED", 2.0, 85.0)
     assert "throughput below demand" in _reason_for("CONGESTED", -0.5, 85.0)
-    assert "Elevated demand" in _reason_for("BUSY", 2.0, 60.0)
-    assert "balanced" in _reason_for("BUSY", 0.0, 60.0)
+    assert "Elevated demand" in _reason_for("CROWDED", 2.0, 60.0)
+    assert "balanced" in _reason_for("CROWDED", 0.0, 60.0)
     assert "clearing normally" in _reason_for("NORMAL", -2.0, 20.0)
     assert "Nominal" in _reason_for("NORMAL", 0.0, 20.0)
+    assert "Queue clear" in _reason_for("EMPTY", 0.0, 0.0)
+    assert "nearly empty" in _reason_for("SPARSE", 0.0, 5.0)
+    assert "not configured" in _reason_for("UNCONFIGURED", None, None)
+    assert "No queue reading" in _reason_for("DATA_UNAVAILABLE", None, None)
+    # None metrics are never quoted as numbers.
+    assert "high occupancy" in _reason_for("BACKLOG", None, None)
 
 
 def test_derive_system_status():
@@ -170,7 +176,7 @@ def test_build_dashboard_snapshot_normal():
     result = build_dashboard_snapshot(snap, config, history, server_start_ts)
 
     assert isinstance(result, DashboardSnapshot)
-    assert result.scenario == "NORMAL"
+    assert result.scenario == "ONLINE"  # availability summary, not queue state
     assert result.queue.queue == 5
     assert result.queue.capacity == 30
     assert result.queue.occupancy == 16.7
@@ -258,7 +264,7 @@ def test_build_dashboard_snapshot_unconfigured_source_state():
     result = build_dashboard_snapshot(snap, config, history, server_start_ts)
 
     assert result.queue.source_state == "UNCONFIGURED"
-    assert result.queue.state == "NORMAL"  # UI state is NORMAL
+    assert result.queue.state == "UNCONFIGURED"  # passed through, not re-bucketed
 
 
 def test_build_dashboard_snapshot_backlog():
@@ -277,7 +283,7 @@ def test_build_dashboard_snapshot_backlog():
 
     result = build_dashboard_snapshot(snap, config, history, server_start_ts)
 
-    assert result.scenario == "BACKLOG"
+    assert result.scenario == "ONLINE"  # camera is up; condition lives in state
     assert result.queue.state == "BACKLOG"
     assert "exceeds capacity" in result.queue.reason
 
@@ -293,15 +299,122 @@ def test_reset_adapter_state():
     build_dashboard_snapshot(snap, config, history, server_start_ts)
     reset_adapter_state()
 
-    # After reset, OFFLINE should show 0
+    # After reset no reading has ever existed: nothing to freeze, so the
+    # offline snapshot reports explicit unavailability — not a fabricated 0.
     snap_offline = MockQueueSnapshot(
         people_in_queue=0,
         queue_state="DATA_UNAVAILABLE",
         camera_state=MockCameraState(link="OFFLINE"),
     )
     result = build_dashboard_snapshot(snap_offline, config, history, server_start_ts)
-    assert result.queue.queue == 0
-    assert result.queue.state == "NORMAL"
+    assert result.queue.queue is None
+    assert result.queue.state == "DATA_UNAVAILABLE"
+    assert result.queue.state_active is False
+    assert result.last_known_queue is None
+    assert result.queue.entry_rate is None
+
+
+def test_no_pipeline_snapshot_is_explicitly_unavailable():
+    """API up, pipeline down: every measurement is null, never zero."""
+    reset_adapter_state()
+    config = MockCameraConfig()
+    result = build_dashboard_snapshot(None, config, [], 1700000000.0)
+
+    assert result.scenario == "NO_DATA"
+    assert result.queue.state == "DATA_UNAVAILABLE"
+    assert result.queue.state_active is False
+    assert result.queue.queue is None
+    assert result.queue.occupancy is None
+    assert result.queue.entry_rate is None
+    assert result.queue.avg_wait is None
+    assert result.queue.predicted_wait is None
+    assert result.queue.service_time_s is None
+    assert result.queue.pacing_status is None
+    assert result.camera.link == "OFFLINE"
+    assert result.camera.source_label == ""  # never a fabricated identifier
+    assert result.last_known_queue is None
+    assert result.system.detection_status == "STALLED"
+    assert result.system.tracking_status == "STALLED"
+    assert result.system.analytics_status == "STALLED"
+
+
+def test_predicted_values_keep_units_and_absence():
+    """Seconds → minutes on the wire; missing values stay None."""
+    reset_adapter_state()
+    snap = MockQueueSnapshot()
+    snap.predicted_wait_s = 300.0     # 5 min
+    snap.clearance_time_s = 120.0     # 2 min
+    snap.service_time_s = 20.0
+    snap.pacing_status = "SLOW_INSPECTION"
+    result = build_dashboard_snapshot(snap, MockCameraConfig(), [], 1700000000.0)
+
+    assert result.queue.predicted_wait == 5.0
+    assert result.queue.clearance_time == 2.0
+    assert result.queue.service_time_s == 20.0
+    assert result.queue.pacing_status == "SLOW_INSPECTION"
+
+    # A pipeline that reports none gets nulls — no default dressed up as
+    # a measurement.
+    reset_adapter_state()
+    plain = MockQueueSnapshot()
+    result2 = build_dashboard_snapshot(plain, MockCameraConfig(), [], 1700000000.0)
+    assert result2.queue.predicted_wait is None
+    assert result2.queue.clearance_time is None
+    assert result2.queue.service_time_s is None
+    assert result2.queue.pacing_status is None
+
+
+def test_frame_clock_is_zero_when_no_frame_ever_arrived():
+    """last_update/frame_ts come from the frame clock, never from "now".
+
+    A snapshot built without any frame (camera never opened) must report
+    0 = never. Deriving the clock from the build timestamp would claim
+    freshness for a frame that does not exist.
+    """
+    reset_adapter_state()
+    never = MockQueueSnapshot(fps=0.0, camera_state=MockCameraState(link="OFFLINE"))
+    assert not hasattr(never, "last_frame_unix")
+    result = build_dashboard_snapshot(never, MockCameraConfig(), [], 1700000000.0)
+    assert result.last_update == 0
+    assert result.frame_ts == 0
+
+    # A frame that did arrive ages the reading with its real clock.
+    with_frame = MockQueueSnapshot()
+    with_frame.last_frame_unix = 1700000012.5
+    result2 = build_dashboard_snapshot(with_frame, MockCameraConfig(), [], 1700000000.0)
+    assert result2.last_update == 1700000012500
+    assert result2.frame_ts == 1700000012500
+
+
+def test_camera_status_passthrough_and_default():
+    """The supervisor's camera status reaches the wire; legacy links derive."""
+    reset_adapter_state()
+    cam = MockCameraState(link="OFFLINE")
+    cam.status = "RECONNECTING"
+    result = build_dashboard_snapshot(
+        MockQueueSnapshot(camera_state=cam), MockCameraConfig(), [], 1700000000.0)
+    assert result.camera.status == "RECONNECTING"
+
+    # Legacy pipeline that does not report status: derive from the link.
+    reset_adapter_state()
+    result2 = build_dashboard_snapshot(
+        MockQueueSnapshot(), MockCameraConfig(), [], 1700000000.0)
+    assert result2.camera.status == "OK"
+
+
+def test_component_statuses_stall_without_frames():
+    """No fresh frames → every frame-consuming component is STALLED."""
+    reset_adapter_state()
+    cam = MockCameraState(link="OFFLINE")
+    snap = MockQueueSnapshot(camera_state=cam, fps=0.0)
+    assert _component_statuses(snap) == {
+        "detection": "STALLED", "tracking": "STALLED", "analytics": "STALLED"}
+    # Frames flowing at rate → statuses derived from the measured FPS.
+    reset_adapter_state()
+    live = _component_statuses(MockQueueSnapshot(fps=24.0))
+    assert live == {"detection": "OK", "tracking": "OK", "analytics": "OK"}
+    slow = _component_statuses(MockQueueSnapshot(fps=5.0))
+    assert slow == {"detection": "DEGRADED", "tracking": "DEGRADED", "analytics": "DEGRADED"}
 
 
 def test_serialization():

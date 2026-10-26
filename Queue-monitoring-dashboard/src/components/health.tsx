@@ -1,26 +1,112 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { X, Camera, Activity, Sliders, ShieldCheck, Terminal, Power } from "lucide-react";
-import type { Snapshot, Scenario } from "../lib/telemetry";
+import type { Snapshot, Connection } from "../lib/telemetry";
 import type { CameraSourceInfo, ConfigResponse } from "../lib/api";
 import { getCameraSources, selectCameraSource, setCameraRotation } from "../lib/api";
-import { StatusMark, healthStyle, QUEUE_STYLE, fmtDuration, fmtClock, type StatusStyle } from "../lib/ui";
+import { StatusMark, healthStyle, fmtDuration, fmtClock, type StatusStyle } from "../lib/ui";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Operator health: the four conditions that decide whether a reading can be
 // trusted. Technical detail belongs in the diagnostics drawer, not here.
+// Connectivity (backend / camera / frames) is tracked here as a link state,
+// never as a queue condition — that always comes from `s.state`.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Camera health including the supervisor's lifecycle detail. */
+function cameraLinkStyle(s: Snapshot): StatusStyle {
+  if (s.connection === "RECONNECTING")
+    return { color: "var(--st-busy)", label: "Reconnecting", glyph: "diamond" };
+  if (s.connection === "NO_FRAMES")
+    return { color: "var(--st-busy)", label: "No frames", glyph: "diamond" };
+  if (s.connection === "CAMERA_OFFLINE")
+    return { color: "var(--st-offline)", label: "Offline", glyph: "ring" };
+  return healthStyle(s.camera.link);
+}
+
 function monitoringStyle(s: Snapshot): StatusStyle {
+  if (s.connection === "BACKEND_UNAVAILABLE")
+    return { color: "var(--st-backlog)", label: "Stopped", glyph: "square" };
+  if (s.connection === "NO_DATA")
+    return { color: "var(--st-busy)", label: "Starting", glyph: "diamond" };
+  if (s.connection === "RECONNECTING" || s.connection === "NO_FRAMES")
+    return { color: "var(--st-busy)", label: "Interrupted", glyph: "diamond" };
   if (!s.stateActive) return { color: "var(--st-backlog)", label: "Stopped", glyph: "square" };
   if (s.cv.detection === "DEGRADED") return { color: "var(--st-busy)", label: "Reduced", glyph: "diamond" };
   return { color: "var(--st-normal)", label: "Active", glyph: "circle" };
 }
 
 function dataStyle(s: Snapshot): StatusStyle {
-  if (!s.stateActive) return { color: "var(--st-backlog)", label: "Stale", glyph: "square" };
-  if (s.camera.link === "DEGRADED") return { color: "var(--st-busy)", label: "Delayed", glyph: "diamond" };
+  if (s.connection === "BACKEND_UNAVAILABLE")
+    return { color: "var(--st-backlog)", label: "No backend", glyph: "square" };
+  if (s.connection === "NO_DATA")
+    return { color: "var(--st-offline)", label: "No data", glyph: "ring" };
+  if (!s.stateActive)
+    // "Last known" is only honest when a reading actually froze; if no
+    // reading ever existed there is nothing to call "last known".
+    return s.lastKnownQueue !== null
+      ? { color: "var(--st-busy)", label: "Last known", glyph: "diamond" }
+      : { color: "var(--st-offline)", label: "No data", glyph: "ring" };
+  if (s.connection === "DEGRADED") return { color: "var(--st-busy)", label: "Delayed", glyph: "diamond" };
   return { color: "var(--st-normal)", label: "Updating", glyph: "circle" };
 }
+
+/** Is the console talking to the backend API at all? */
+function backendStyle(s: Snapshot): StatusStyle {
+  if (s.connection === "BACKEND_UNAVAILABLE")
+    return { color: "var(--st-backlog)", label: "Unreachable", glyph: "square" };
+  if (s.connection === "NO_DATA")
+    return { color: "var(--st-busy)", label: "Starting", glyph: "diamond" };
+  return { color: "var(--st-normal)", label: "Reachable", glyph: "circle" };
+}
+
+/** Queue reading availability: live, frozen last-known, or never produced. */
+function queueDataStyle(s: Snapshot): StatusStyle {
+  if (s.state === "UNCONFIGURED")
+    return { color: "var(--st-offline)", label: "Not configured", glyph: "ring" };
+  if (s.state === "DATA_UNAVAILABLE")
+    return { color: "var(--st-offline)", label: "No reading", glyph: "ring" };
+  if (!s.stateActive) return { color: "var(--st-busy)", label: "Last known", glyph: "diamond" };
+  return { color: "var(--st-normal)", label: "Live", glyph: "circle" };
+}
+
+const CONNECTION_CHIP: Record<Connection, { word: string; color: string; sentence: string }> = {
+  LIVE: {
+    word: "Live camera",
+    color: "var(--st-normal)",
+    sentence: "Every value below comes from the detection pipeline running on this machine.",
+  },
+  DEGRADED: {
+    word: "Degraded",
+    color: "var(--st-busy)",
+    sentence: "Frames are arriving slowly: readings are low-confidence.",
+  },
+  RECONNECTING: {
+    word: "Reconnecting",
+    color: "var(--st-busy)",
+    sentence: "The camera stopped delivering frames. The pipeline is retrying automatically.",
+  },
+  NO_FRAMES: {
+    word: "No frames",
+    color: "var(--st-busy)",
+    sentence: "The camera opened but is not delivering frames yet.",
+  },
+  CAMERA_OFFLINE: {
+    word: "Camera offline",
+    color: "var(--st-offline)",
+    sentence:
+      "The camera is unavailable. Automatic retry stopped; select a camera source below to retry.",
+  },
+  NO_DATA: {
+    word: "No data",
+    color: "var(--st-offline)",
+    sentence: "The pipeline has not produced a queue reading yet.",
+  },
+  BACKEND_UNAVAILABLE: {
+    word: "Backend unreachable",
+    color: "var(--st-backlog)",
+    sentence: "The console cannot reach the backend API on this machine.",
+  },
+};
 
 function recStyle(s: Snapshot): StatusStyle {
   return s.recording.active
@@ -52,7 +138,7 @@ export function OperatorHealth({
   if (compact) {
     // Narrow screens cannot fit four conditions. Show the one that decides
     // whether the reading can be trusted and keep the rest in diagnostics.
-    const camera = healthStyle(s.camera.link);
+    const camera = cameraLinkStyle(s);
     return (
       <div className="flex items-center gap-sm">
         <HealthItem label="Camera" status={camera} />
@@ -71,7 +157,7 @@ export function OperatorHealth({
 
   return (
     <div className="flex items-center gap-md">
-      <HealthItem label="Camera" status={healthStyle(s.camera.link)} />
+      <HealthItem label="Camera" status={cameraLinkStyle(s)} />
       <span className="h-4 w-px bg-rule" aria-hidden />
       <HealthItem label="Monitoring" status={monitoringStyle(s)} />
       <span className="h-4 w-px bg-rule" aria-hidden />
@@ -127,8 +213,6 @@ function Row({ label, value, state }: { label: string; value?: string; state?: S
   );
 }
 
-const SCENARIOS: Scenario[] = ["NORMAL", "BUSY", "CONGESTED", "BACKLOG", "DEGRADED", "OFFLINE"];
-
 const ROTATION_OPTIONS = [0, 90, 180, 270] as const;
 const CAMERA_SOURCES_COUNT = 5;
 
@@ -138,8 +222,8 @@ const CAMERA_SOURCES_COUNT = 5;
  * Set rarely (after a camera move or remount), so the controls live in
  * diagnostics, not on the operator surface. The buttons act on the API
  * endpoints; the truth rows above (source, rotation) always come from
- * the pipeline snapshot. Controls are hidden while the simulated data
- * feed is selected — a control panel on generated numbers would be a lie.
+ * the pipeline snapshot. With the camera offline, selecting a source is
+ * the manual retry that re-opens the device.
  */
 function CameraInputGroup({
   rotationDeg,
@@ -271,20 +355,12 @@ export function DiagnosticsDrawer({
   open,
   onClose,
   config = null,
-  dataSource = "api",
-  onDataSource,
-  scenario,
-  onScenario,
   onShutdown,
 }: {
   s: Snapshot;
   open: boolean;
   onClose: () => void;
   config?: ConfigResponse | null;
-  dataSource?: "api" | "simulator";
-  onDataSource?: (s: "api" | "simulator") => void;
-  scenario: Scenario;
-  onScenario: (x: Scenario) => void;
   onShutdown: () => void;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -365,51 +441,38 @@ export function DiagnosticsDrawer({
         </div>
 
         <div className="flex flex-col gap-lg px-lg py-lg">
-          {/* Source mode */}
+          {/* Pipeline availability: which link is broken, if any. This is
+              connectivity only — the queue condition itself never lives
+              here, it is always `s.state` from the backend classifier. */}
           <section>
             <div className="mb-xs flex items-center justify-between">
-              <span className="t-label text-text-tertiary">Data mode</span>
+              <span className="t-label text-text-tertiary">Pipeline</span>
               <span
                 className="rounded-corner-sm px-sm py-0.5 text-[11px] font-semibold"
                 style={{
-                  color: dataSource === "api" ? "var(--st-normal)" : "var(--st-busy)",
-                  background: `color-mix(in srgb, ${
-                    dataSource === "api" ? "var(--st-normal)" : "var(--st-busy)"
-                  } 12%, transparent)`,
+                  color: CONNECTION_CHIP[s.connection].color,
+                  background: `color-mix(in srgb, ${CONNECTION_CHIP[s.connection].color} 12%, transparent)`,
                 }}
               >
-                {dataSource === "api" ? "Live camera" : "Simulated data"}
+                {CONNECTION_CHIP[s.connection].word}
               </span>
             </div>
             <p className="t-body mb-sm text-text-tertiary">
-              {dataSource === "api"
-                ? "Every value below comes from the detection pipeline running on this machine."
-                : "These values are generated by the built-in simulator. They are not measurements."}
+              {CONNECTION_CHIP[s.connection].sentence}
             </p>
-            <div className="flex gap-xs">
-              <button
-                type="button"
-                className="ctl flex-1 justify-center"
-                data-active={dataSource === "api"}
-                aria-pressed={dataSource === "api"}
-                onClick={() => onDataSource?.("api")}
-              >
-                Live camera
-              </button>
-              <button
-                type="button"
-                className="ctl flex-1 justify-center"
-                data-active={dataSource === "simulator"}
-                aria-pressed={dataSource === "simulator"}
-                onClick={() => onDataSource?.("simulator")}
-              >
-                Simulator
-              </button>
+            <div className="rounded-corner-md border border-border-primary bg-surface-secondary-bg px-md">
+              <Row label="Backend" state={backendStyle(s)} />
+              <Row label="Camera" state={cameraLinkStyle(s)} />
+              <Row label="Frames" value={lastFrameLabel(s)} />
+              <Row label="Queue reading" state={queueDataStyle(s)} />
+              <Row label="Detection" state={healthStyle(s.cv.detection)} />
+              <Row label="Tracking" state={healthStyle(s.cv.tracking)} />
+              <Row label="Analytics" state={healthStyle(s.cv.analytics)} />
             </div>
           </section>
 
           <Group title="Camera feed" icon={<Camera size={13} />}>
-            <Row label="Connection" state={healthStyle(c.link)} />
+            <Row label="Connection" state={cameraLinkStyle(s)} />
             <Row label="Source" value={c.sourceLabel && c.sourceLabel !== "" ? c.sourceLabel : "Not reported"} />
             <Row
               label="Image rotation"
@@ -420,7 +483,8 @@ export function DiagnosticsDrawer({
               }
             />
             <Row label="Resolution" value={c.resolution} />
-            <Row label="Frame rate" value={`${s.stateActive ? c.fps : 0} fps`} />
+            {/* Measured while frames flow; "—" when the camera delivers none. */}
+            <Row label="Frame rate" value={s.stateActive && c.fps > 0 ? `${c.fps} fps` : "—"} />
             <Row label="Latency" value={c.latencyMs === null ? "Not measured" : `${c.latencyMs} ms`} />
             <Row label="Packet loss" value={c.packetLoss === null ? "Not measured" : `${c.packetLoss}%`} />
             <Row label="Last frame" value={lastFrameLabel(s)} />
@@ -428,14 +492,12 @@ export function DiagnosticsDrawer({
           </Group>
 
           {/* Setup controls live in diagnostics, off the operator surface.
-              Not offered on the simulated feed: controls on generated data
-              would be a lie. */}
-          {dataSource === "api" && (
-            <CameraInputGroup
-              rotationDeg={c.rotationDeg ?? 0}
-              runningIndex={c.sourceIndex}
-            />
-          )}
+              Selecting a source while the camera is offline is also the
+              manual retry for a stopped reconnect sequence. */}
+          <CameraInputGroup
+            rotationDeg={c.rotationDeg ?? 0}
+            runningIndex={c.sourceIndex}
+          />
 
           <Group title="Queue geometry" icon={<Sliders size={13} />}>
             <Row
@@ -504,43 +566,6 @@ export function DiagnosticsDrawer({
             </Group>
           )}
 
-          {/* Demo controls live here, never in the operator header. */}
-          {dataSource === "simulator" && (
-            <section className="border-t border-border-primary pt-lg">
-              <div className="mb-sm flex items-center gap-xs">
-                <span className="t-label text-text-tertiary">Simulation scenario</span>
-              </div>
-              <div className="flex flex-col gap-xs">
-                {SCENARIOS.map((sc) => {
-                  const st = QUEUE_STYLE[sc];
-                  const active = scenario === sc;
-                  return (
-                    <button
-                      key={sc}
-                      type="button"
-                      onClick={() => onScenario(sc)}
-                      aria-pressed={active}
-                      className={`flex flex-col items-start gap-0.5 rounded-corner-sm border p-sm text-left transition-colors ${
-                        active
-                          ? "border-control bg-bg-subtle"
-                          : "border-border-primary bg-surface-secondary-bg hover:bg-bg-hover"
-                      }`}
-                    >
-                      <span className="flex items-center gap-xs">
-                        <StatusMark status={st} size={11} />
-                        <span className="text-[12px] font-semibold" style={{ color: st.color }}>
-                          {st.label}
-                        </span>
-                        {active && <span className="text-[11px] text-text-tertiary">Active</span>}
-                      </span>
-                      <span className="text-[11px] leading-snug text-text-tertiary">{st.description}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </section>
-          )}
-
           {/* Shutting the pipeline down is a technician action, so it lives
               here rather than in the operator header. */}
           <section className="border-t border-border-primary pt-lg">
@@ -560,7 +585,7 @@ export function DiagnosticsDrawer({
               }}
               onClick={onShutdown}
             >
-              Shut down the pipeline
+              Shut Down
             </button>
           </section>
         </div>

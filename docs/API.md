@@ -107,8 +107,16 @@ The FastAPI server provides real-time queue monitoring data for the React dashbo
 
 **Status Values:**
 - `camera.link`: `"ONLINE"` | `"OFFLINE"` | `"DEGRADED"`
+- `camera.status`: `"OK"` | `"RECONNECTING"` | `"NO_FRAMES"` | `"OFFLINE"` | `""` (not reported)
 - `cv.*`: `"OK"` | `"DEGRADED"` | `"STALLED"`
 - `data.status`: `"LIVE"` | `"STALE"` | `"OFFLINE"` | `"NO_DATA"`
+
+When the camera fails to open or stops delivering frames, this endpoint
+keeps responding: the FastAPI service and the detection loop run in the
+same process, and the capture supervisor enters a bounded reconnect
+sequence (5 attempts, increasing backoff 1/2/4/8 s, 15 s cap) instead of exiting. After
+exhaustion `camera.status` becomes `"OFFLINE"` and a manual source
+selection restarts the sequence.
 
 ---
 
@@ -246,17 +254,39 @@ additive to the `/api/*` endpoints above and return the
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `scenario` | string | `"NORMAL"` \| `"BUSY"` \| `"CONGESTED"` \| `"BACKLOG"` \| `"DEGRADED"` \| `"OFFLINE"` |
+| `scenario` | string | Pipeline **availability summary** (not the queue condition): `"ONLINE"` \| `"DEGRADED"` \| `"OFFLINE"` \| `"NO_DATA"`. The queue condition itself is `queue.state`. |
 | `queue` | QueueTelemetry | Queue occupancy, flow, waiting and trend |
 | `system` | SystemTelemetry | Pipeline performance |
 | `camera` | CameraTelemetry | Camera link and health |
 | `recording` | RecordingTelemetry | Recording subsystem state |
-| `last_known_queue` | integer | Last trustworthy queue reading (used while offline) |
-| `last_update` | integer | Epoch ms of the snapshot |
+| `last_known_queue` | integer \| **null** | Last trustworthy queue reading (shown while offline); `null` when no reading ever existed |
+| `last_update` | integer | Epoch ms of the newest frame the analytics saw (`0` = never) |
 | `history` | Sample[] | Evenly downsampled view of the 60-minute history buffer (≤ 240 points; full detail via `GET /api/dashboard/history`) |
 | `events` | EventInfo[] | Recent operator events |
 | `tracks` | TrackInfo[] | Normalized track boxes (0..1) |
 | `frame_ts` | integer | Epoch ms of the frame the snapshot was built from |
+
+#### QueueTelemetry
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `queue` | integer \| **null** | Passengers waiting; `null` when no reading exists (never a fabricated `0`) |
+| `capacity` | integer | Queue capacity from configuration |
+| `occupancy` | number \| **null** | Percent of capacity; `null` when not measured |
+| `congestion_sec` | number \| **null** | Seconds in congested/backlog; `null` when no reading |
+| `entry_rate` / `exit_rate` | number \| **null** | Crossings per minute; `null` when no reading (`0` is a real measurement and only appears when a reading exists) |
+| `net_change` | number \| **null** | Entry − exit per minute |
+| `trend` | string \| **null** | `"GROWING"` \| `"CLEARING"` \| `"STEADY"` \| `null` |
+| `avg_wait` / `longest_wait` | number \| **null** | Minutes |
+| `throughput` | number \| **null** | Crossings per hour |
+| `state` | string | **Backend classifier, passed through unchanged**: `"EMPTY"` \| `"SPARSE"` \| `"NORMAL"` \| `"CROWDED"` \| `"CONGESTED"` \| `"BACKLOG"` \| `"UNCONFIGURED"` \| `"DATA_UNAVAILABLE"` (legacy `"BUSY"` is normalised to `"CROWDED"`) |
+| `state_active` | boolean | `true` only while a live camera reading backs the state |
+| `reason` | string | Operator-language explanation of the state |
+| `action` | string \| **null** | Operational guidance for the condition; `null` when there is no live reading |
+| `predicted_wait` | number \| **null** | Little's Law estimate, minutes; `null` when the estimator has no output |
+| `clearance_time` | number \| **null** | Estimated queue clearance, minutes |
+| `service_time_s` | number \| **null** | Seconds per passenger, when measured |
+| `pacing_status` | string \| **null** | `"OPTIMAL"` \| `"STEADY"` \| `"SLOW_INSPECTION"` \| `"STAGNANT"` \| `"IDLE"` \| `null` (not reported) |
 
 #### SystemTelemetry
 
@@ -265,7 +295,7 @@ additive to the `/api/*` endpoints above and return the
 | `inference_ms` | number | Measured inference time per frame |
 | `model` / `tracker` | string | `"YOLOv5s"` / `"SORT"` |
 | `detections` / `active_tracks` | integer | Detection and track counts |
-| `detection_status` / `tracking_status` / `analytics_status` | string | `"OK"` \| `"DEGRADED"` \| `"STALLED"` |
+| `detection_status` / `tracking_status` / `analytics_status` | string | `"OK"` \| `"DEGRADED"` \| `"STALLED"` — all `STALLED` while frames are not flowing |
 | `device` | string | Compute device the inference ran on (`"mps"`, `"cpu"`, …) |
 
 #### CameraTelemetry
@@ -273,12 +303,16 @@ additive to the `/api/*` endpoints above and return the
 | Field | Type | Description |
 |-------|------|-------------|
 | `link` | string | `"ONLINE"` \| `"OFFLINE"` \| `"DEGRADED"` |
-| `fps` | number | Measured capture rate |
+| `status` | string | Capture-supervisor lifecycle: `"OK"` \| `"RECONNECTING"` \| `"NO_FRAMES"` \| `"OFFLINE"` \| `""` (not reported). Distinguishes retries-in-progress from retries-stopped. |
+| `fps` | number | Measured capture rate (`0` when no frames flow) |
 | `resolution` | string | `"WxH"` |
 | `latency_ms` | number \| **null** | `null` when the pipeline does not measure it (this build has no network hop to time). A `0` would be indistinguishable from a real measurement. |
 | `packet_loss` | number \| **null** | `null` when not measured |
 | `last_frame_age_ms` | integer | **Measured** age of the newest captured frame |
 | `uptime_sec` | integer | Seconds since the server started |
+| `source_label` | string | Camera chrome label reported by the pipeline (`""` when not reported; clients must not invent one) |
+| `source_index` | integer \| null | Webcam index while a webcam is active |
+| `rotation_deg` | integer | Active clockwise rotation (0/90/180/270) |
 
 #### RecordingTelemetry
 
@@ -382,6 +416,11 @@ the current source. A valid switch persists `camera.source` in
 opens the new device; the old stream is released only after the new one
 delivers frames.
 
+**While the camera is offline** the "already running" no-op does not
+apply: re-selecting the current index is the manual retry. The request is
+probed, queued to the loop, and resets the reconnect backoff (this is the
+endpoint behind the dashboard's Retry control).
+
 ### POST /api/dashboard/camera/rotation
 
 **Purpose:** Rotate the image stream clockwise ahead of detection
@@ -404,6 +443,9 @@ Operator events: `camera_rotation` → "Image rotation changed" and
 
 **Purpose:** Liveness of the API and the camera.
 **Response:** `status`, `camera`, `api`, `last_frame_age_ms`.
+**`status` values:** `"OK"` \| `"DEGRADED"` \| `"STALE"` \| `"CAMERA_OFFLINE"` \| `"NO_DATA"` —
+`NO_DATA` when the API is up but no snapshot has been produced yet, so a
+reachable backend is never reported as healthy-but-silent.
 
 ### GET /api/dashboard/history
 
@@ -446,7 +488,7 @@ completed within 10 s, and says so in the log. The endpoint never calls
 | `people_in_queue` | integer | Tracks with centroid in ROI |
 | `total_in` | integer | Cumulative ENTER crossings |
 | `total_out` | integer | Cumulative EXIT crossings |
-| `queue_state` | string | `"NORMAL"` \| `"BUSY"` \| `"CONGESTED"` \| `"BACKLOG"` \| `"DATA_UNAVAILABLE"` |
+| `queue_state` | string | Classifier vocabulary, passed through: `"EMPTY"` \| `"SPARSE"` \| `"NORMAL"` \| `"CROWDED"` \| `"CONGESTED"` \| `"BACKLOG"` \| `"UNCONFIGURED"` \| `"DATA_UNAVAILABLE"` |
 | `occupancy_percent` | number | people_in_queue / queue_capacity × 100 |
 | `entry_rate` | number | ENTER crossings per minute (1-min window) |
 | `exit_rate` | number | EXIT crossings per minute (1-min window) |
@@ -499,6 +541,7 @@ completed within 10 s, and says so in the log. The endpoint never calls
 | Field | Type | Description |
 |-------|------|-------------|
 | `link` | string | `"ONLINE"` \| `"OFFLINE"` \| `"DEGRADED"` |
+| `status` | string | Capture-supervisor lifecycle: `"OK"` \| `"RECONNECTING"` \| `"NO_FRAMES"` \| `"OFFLINE"` \| `""` (older pipelines do not report it) |
 | `fps` | number | Camera capture FPS |
 | `resolution` | string | `"WxH"` of the measured (post-rotation) frame |
 | `frame_age_ms` | integer | Estimated frame interval (ms) |

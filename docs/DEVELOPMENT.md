@@ -65,8 +65,9 @@ cd Queue-monitoring-dashboard
 pnpm dev                                     # http://localhost:8443
 ```
 
-The dashboard starts in **LIVE** mode (proxied `/api` → `localhost:8080`);
-switch to **DEMO** in the top bar for simulator data. Image sources
+The dashboard polls the backend at 1 Hz (proxied `/api` → `localhost:8080`);
+with no backend reachable it shows an explicit "Backend unreachable" state
+rather than inventing data. Image sources
 (`*.jpg`) are single-shot: streaming/hot-reload need camera or video sources.
 
 ### Useful backend commands
@@ -116,7 +117,7 @@ Airport-Project/
 │   ├── yolov5/                  # Vendored YOLOv5 repo
 │   ├── requirements/, Makefile, run.sh
 └── Queue-monitoring-dashboard/  # React 19 + Vite 8 + Tailwind v4
-    ├── src/App.tsx              # Layout, LIVE/DEMO switching
+    ├── src/App.tsx              # Layout, theme toggle
     ├── src/components/          # sections, charts, health, MappingEditor
     ├── src/lib/                 # api.ts, telemetry.ts, mapping.ts (+tests)
     ├── vite.config.ts, package.json, vitest.config.ts
@@ -134,7 +135,7 @@ Airport-Project/
 | Snapshot serialization | `app/snapshot.py` |
 | Shared state HTTP side | `app/api_server.py`, `app/api_models.py`, `app/dashboard_models.py` |
 | Frontend API contract | `src/lib/api.ts` |
-| Frontend data hooks (live + simulator) | `src/lib/telemetry.ts` |
+| Frontend data hook (API polling, honest unavailable states) | `src/lib/telemetry.ts` |
 | Geometry transforms (editor) | `src/lib/mapping.ts` |
 | Dashboard panels | `src/components/sections.tsx` |
 
@@ -143,8 +144,8 @@ Airport-Project/
 ```bash
 cd airport_people_counter
 
-make test                 # unittest discover — 265 tests (2026-10-22)
-venv/bin/python -m pytest tests -q      # pytest — 310 tests (2026-10-22)
+make test                 # unittest discover — 308 tests (2026-10-23)
+venv/bin/python -m pytest tests -q      # pytest — 358 tests (2026-10-23)
 
 # Targeted
 venv/bin/python -m unittest tests.test_queue_prototype -v
@@ -157,7 +158,7 @@ make smoke
 
 ```bash
 cd Queue-monitoring-dashboard
-pnpm test                 # vitest — 30 tests (2026-10-21)
+pnpm test                 # vitest — 40 tests (2026-10-23)
 npx tsc --noEmit          # type check
 pnpm run build            # production build (must stay green)
 ```

@@ -21,7 +21,8 @@ a glance. Full product definition: [docs/PRD.md](docs/PRD.md).
   feed (“Edit mapping”), saved per camera in `config/mappings.yaml` with
   atomic writes and instant hot reload
 - Live operator dashboard (React): status, camera, key-metric tiles, charts,
-  waiting-time panel, activity log, diagnostics drawer, LIVE + DEMO modes
+  waiting-time panel, activity log, diagnostics drawer, dark/light themes,
+  explicit backend/camera availability states
 - Event/samples recording (JSONL), offline accuracy evaluator, and a full
   dataset/training tooling chain for a future custom model
 
@@ -113,6 +114,38 @@ fusion / MQTT / cloud, facial recognition or passenger identification,
 production-grade accuracy claims (accuracy gates not yet passed on real
 footage), and a multi-lane UI. Justification and status: [docs/PRD.md §7](docs/PRD.md).
 
+## Contributing
+
+Private team repository — clone with access granted to your GitHub account:
+
+```bash
+git clone https://github.com/Ridhoathallah/Airport-Project.git
+cd Airport-Project
+```
+
+### Branch workflow
+
+| Branch | Purpose |
+|--------|---------|
+| `main` | Stable code — always green; never commit directly |
+| `feature/<name>` | New features, branched off `main` |
+| `fix/<name>` | Bug fixes |
+
+```bash
+git switch main && git pull
+git switch -c feature/<name>
+# ... work, verify (make test, pnpm test, pnpm run build) ...
+git add <reviewed-files> && git commit -m "feat: <summary>"
+git push -u origin feature/<name>
+# open a Pull Request on GitHub, then merge after review
+```
+
+Run the project's checks before opening a PR — the commands are in
+[Verify an Installation](#verify-an-installation). Coding-agent guidance and
+required gates: [AGENTS.md](AGENTS.md). No `.env` file is needed; all runtime
+values are flags and YAML config (`docs/CONFIGURATION.md`).
+
 ---
 
-Internal project — not published.
+Internal project — private repository. Never commit secrets, model weights,
+datasets, or captured footage; see `.gitignore` and `docs/DEVELOPMENT.md`.

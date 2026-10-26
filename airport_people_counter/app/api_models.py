@@ -30,6 +30,9 @@ class CameraState(BaseModel):
     source_index: Optional[int] = None
     #: Clockwise rotation applied at the capture edge.
     rotation_deg: int = 0
+    #: Camera lifecycle state ("OK" | "RECONNECTING" | "NO_FRAMES" |
+    #: "OFFLINE" | "" unknown), as reported by the capture supervisor.
+    status: str = ""
 
 
 class Track(BaseModel):

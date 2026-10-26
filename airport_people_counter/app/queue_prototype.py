@@ -2060,6 +2060,13 @@ class SystemMetrics:
     #: measured values over the requested config width/height.
     frame_w: int = 0
     frame_h: int = 0
+    #: Camera lifecycle state reported by the capture supervisor:
+    #: "OK" (delivering frames), "RECONNECTING" (camera lost, bounded
+    #: retries in progress), "NO_FRAMES" (source opened but no frames
+    #: delivered), "OFFLINE" (retries exhausted, awaiting manual retry),
+    #: "" (unknown / older pipeline). Never fabricated — empty when the
+    #: pipeline does not report it.
+    camera_status: str = ""
 
 
 @dataclass

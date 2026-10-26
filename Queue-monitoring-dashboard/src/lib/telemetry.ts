@@ -2,14 +2,39 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { getSnapshot, getConfig, type SnapshotResponse, type ConfigResponse } from "./api";
 
 // ─────────────────────────────────────────────────────────────────────────
-// Camera-only queue telemetry simulator.
-// Single source of truth: every derived metric (occupancy, rates, wait,
-// state, trend) is computed from the same underlying queue dynamics so the
-// numbers always logically agree with each other.
+// Camera-only queue telemetry. The backend is the single source of truth:
+// the classifier state passes through unchanged, and a metric whose
+// measurement does not exist arrives as null and stays null here. This
+// layer never reclassifies a queue condition and never invents a number.
 // ─────────────────────────────────────────────────────────────────────────
 
-export type QueueState = "NORMAL" | "BUSY" | "CONGESTED" | "BACKLOG";
-export type Scenario = QueueState | "OFFLINE" | "DEGRADED";
+/** The backend classifier's own vocabulary, passed through as-is. */
+export type QueueState =
+  | "EMPTY"
+  | "SPARSE"
+  | "NORMAL"
+  | "CROWDED"
+  | "CONGESTED"
+  | "BACKLOG"
+  | "UNCONFIGURED"
+  | "DATA_UNAVAILABLE";
+
+/**
+ * Connectivity, handled separately from queue classification.
+ *
+ * These are frontend-facing *link* states only: where the telemetry comes
+ * from and whether it is flowing. The queue condition itself is always
+ * `Snapshot.state` (the backend classifier's answer).
+ */
+export type Connection =
+  | "LIVE" // backend reachable, frames flowing fresh
+  | "DEGRADED" // reachable, but slow/stale low-confidence readings
+  | "RECONNECTING" // reachable, camera lost, bounded retries in progress
+  | "NO_FRAMES" // reachable, source opened but delivering no frames
+  | "CAMERA_OFFLINE" // reachable, camera unavailable (retries stopped)
+  | "NO_DATA" // reachable, pipeline has not produced a reading
+  | "BACKEND_UNAVAILABLE"; // cannot reach the backend at all
+
 export type PipelineStatus = "OK" | "DEGRADED" | "STALLED";
 export type LinkStatus = "ONLINE" | "OFFLINE" | "DEGRADED";
 
@@ -24,13 +49,18 @@ export interface Sample {
 
 export interface CameraHealth {
   link: LinkStatus;
+  /**
+   * Camera lifecycle state from the capture supervisor:
+   * "OK" | "RECONNECTING" | "NO_FRAMES" | "OFFLINE" | "" (not reported).
+   */
+  status: string;
   fps: number;
   resolution: string;
   latencyMs: number | null; // null = not measured by this pipeline
   packetLoss: number | null; // %  null = not measured by this pipeline
   lastFrameAgeMs: number;
   uptimeSec: number;
-  /** Camera chrome label reported by the pipeline, e.g. "CAM-01". */
+  /** Camera chrome label reported by the pipeline ("" = not reported). */
   sourceLabel: string;
   /** Live webcam index; null for file/IP/image sources. */
   sourceIndex: number | null;
@@ -95,7 +125,7 @@ export function operatorText(text: string): string {
  *
  * The backend already emits operator language; this is the safety net that
  * keeps an implementation name out of the activity log if one ever slips
- * through, and it normalises the simulator in the same way.
+ * through.
  */
 export function describeEvent(e: QueueEvent): { label: string; detail?: string } {
   const label = operatorText(e.label);
@@ -113,422 +143,42 @@ export interface Track {
 }
 
 export interface Snapshot {
-  scenario: Scenario;
+  /** Where telemetry comes from / whether it flows — never a queue state. */
+  connection: Connection;
   state: QueueState;
-  stateActive: boolean; // false when OFFLINE — queue reading not trustworthy
+  /** True only while a live camera reading backs the state. */
+  stateActive: boolean;
   reason: string;
-  queue: number;
+  /** null when no measurement exists — shown as "—", never as a fake 0. */
+  queue: number | null;
   capacity: number;
-  occupancy: number;
-  congestionSec: number;
-  entryRate: number;
-  exitRate: number;
-  netChange: number; // per min
-  trend: "GROWING" | "CLEARING" | "STEADY";
-  avgWait: number; // min
-  longestWait: number; // min
-  throughput: number; // per hr
+  occupancy: number | null;
+  congestionSec: number | null;
+  entryRate: number | null;
+  exitRate: number | null;
+  netChange: number | null; // per min
+  trend: "GROWING" | "CLEARING" | "STEADY" | null;
+  avgWait: number | null; // min
+  longestWait: number | null; // min
+  throughput: number | null; // per hr
   /** Operational guidance for the current condition, in operator language. */
-  action?: string;
-  predictedWait?: number; // min (Little's Law queue wait estimation)
-  clearanceTime?: number; // min (estimated queue clearance time)
-  serviceTimeS?: number; // seconds per passenger
-  pacingStatus?: "OPTIMAL" | "STEADY" | "SLOW_INSPECTION" | "STAGNANT" | "IDLE";
+  action?: string | null;
+  predictedWait?: number | null; // min (Little's Law queue wait estimation)
+  clearanceTime?: number | null; // min (estimated queue clearance time)
+  serviceTimeS?: number | null; // seconds per passenger
+  /** null when the pipeline did not report one — never a default. */
+  pacingStatus?: string | null;
   camera: CameraHealth;
   cv: CvHealth;
   recording: { active: boolean; sinceSec: number | null; sizeGb: number | null };
-  lastKnownQueue: number; // last trustworthy reading (for OFFLINE)
-  lastUpdate: number; // epoch ms of last live sample
+  /** Last trustworthy queue reading; null when none ever existed. */
+  lastKnownQueue: number | null;
+  lastUpdate: number; // epoch ms of last live sample (0 = never)
   history: Sample[];
   events: QueueEvent[];
   tracks: Track[];
   frameTs: number;
 }
-
-// The capacity mirrors config/camera.yaml (queue_capacity: 30) so the
-// simulator and the live backend agree on what "60% full" means.
-const CAPACITY = 30;
-const TICK_MS = 1000;
-const SIM_STEP_SEC = 15; // each real tick advances simulated time by 15s
-const HISTORY_LEN = 240; // 240 * 15s = 60 min
-
-interface Target {
-  entry: number;
-  exit: number;
-  queue: number;
-}
-
-// Queue levels are chosen against the live occupancy ladder
-// (sparse 10%, normal 40%, crowded 60%, congested 80%) so each scenario
-// lands on the state it names.
-const TARGETS: Record<QueueState, Target> = {
-  NORMAL: { entry: 6, exit: 7, queue: 8 },
-  BUSY: { entry: 12, exit: 10.5, queue: 21 },
-  CONGESTED: { entry: 15, exit: 9.5, queue: 26 },
-  BACKLOG: { entry: 16, exit: 8, queue: 38 },
-};
-
-function classify(occupancy: number): QueueState {
-  if (occupancy >= 100) return "BACKLOG";
-  if (occupancy >= 80) return "CONGESTED";
-  if (occupancy >= 60) return "BUSY";
-  return "NORMAL";
-}
-
-function noise(mag: number) {
-  return (Math.random() - 0.5) * 2 * mag;
-}
-
-interface SimState {
-  queue: number;
-  entry: number;
-  exit: number;
-  congestionSince: number | null;
-  history: Sample[];
-  events: QueueEvent[];
-  eventId: number;
-  lastState: QueueState;
-  uptimeSec: number;
-  recSinceSec: number;
-  now: number;
-}
-
-function seed(scenario: Scenario): SimState {
-  const base: QueueState =
-    scenario === "OFFLINE" || scenario === "DEGRADED" ? "NORMAL" : scenario;
-  const tgt = TARGETS[base];
-  const now = Date.now();
-  const history: Sample[] = [];
-  let q = tgt.queue;
-  for (let i = HISTORY_LEN; i > 0; i--) {
-    const t = now - i * SIM_STEP_SEC * 1000;
-    q = Math.max(0, q + noise(1.2));
-    const occ = (q / CAPACITY) * 100;
-    const entry = Math.max(0, tgt.entry + noise(2));
-    const exit = Math.max(0.5, tgt.exit + noise(2));
-    history.push({
-      t,
-      queue: Math.round(q),
-      occupancy: +occ.toFixed(1),
-      entryRate: +entry.toFixed(1),
-      exitRate: +exit.toFixed(1),
-      avgWait: +(q / Math.max(exit, 0.5)).toFixed(1),
-    });
-  }
-  return {
-    queue: tgt.queue,
-    entry: tgt.entry,
-    exit: tgt.exit,
-    congestionSince: base === "CONGESTED" || base === "BACKLOG" ? now - 214000 : null,
-    history,
-    events: seedEvents(now),
-    eventId: 100,
-    lastState: base,
-    uptimeSec: 27834,
-    recSinceSec: 27810,
-    now,
-  };
-}
-
-function seedEvents(now: number): QueueEvent[] {
-  return [
-    { id: 1, t: now - 44000, kind: "entry", severity: "info", label: "Passenger entered queue" },
-    { id: 2, t: now - 96000, kind: "exit", severity: "info", label: "Passenger cleared screening" },
-    { id: 3, t: now - 168000, kind: "system", severity: "good", label: "Monitoring active" },
-    { id: 4, t: now - 240000, kind: "state", severity: "info", label: "Queue status changed" },
-  ];
-}
-
-function reasonFor(state: QueueState, net: number, occ: number): string {
-  if (state === "BACKLOG")
-    return `Queue exceeds capacity (${occ.toFixed(0)}%): entries outpacing exits`;
-  if (state === "CONGESTED")
-    return net > 1
-      ? `Occupancy above 80% and rising: entry rate exceeds exit rate`
-      : `Occupancy above 80%: throughput below demand`;
-  if (state === "BUSY")
-    return net > 1 ? `Elevated demand: queue filling` : `Elevated occupancy, flow balanced`;
-  return net < -1 ? `Flow clearing normally` : `Nominal: occupancy within safe range`;
-}
-
-/**
- * Operational guidance, mirroring the recommendation table the live
- * pipeline uses (queue_prototype.DEFAULT_RECOMMENDATIONS) so the simulated
- * console gives the same guidance as the real one.
- */
-const SIM_ACTIONS: Record<QueueState, string> = {
-  NORMAL: "Normal load. Monitor lane throughput; no action required.",
-  BUSY: "Queue building. Consider opening an additional screening lane.",
-  CONGESTED:
-    "Congestion detected. Activate overflow management and direct passengers to secondary lanes.",
-  BACKLOG: "Backlog: flow below baseline with long waits. Activate the queue-management protocol.",
-};
-
-function step(s: SimState, scenario: Scenario): SimState {
-  const offline = scenario === "OFFLINE";
-  const degraded = scenario === "DEGRADED";
-  s.now += SIM_STEP_SEC * 1000;
-  s.uptimeSec += SIM_STEP_SEC;
-  if (offline) {
-    // frozen queue reading; nothing trustworthy updates
-    return s;
-  }
-  s.recSinceSec += SIM_STEP_SEC;
-  const base = scenario === "DEGRADED" ? s.lastState : (scenario as QueueState);
-  const tgt = TARGETS[base] ?? TARGETS.NORMAL;
-
-  // ease rates toward target with noise
-  s.entry += (tgt.entry - s.entry) * 0.25 + noise(1.5);
-  s.exit += (tgt.exit - s.exit) * 0.25 + noise(1.2);
-  s.entry = Math.max(0, s.entry);
-  s.exit = Math.max(0.4, s.exit);
-
-  const net = (s.entry - s.exit) * (SIM_STEP_SEC / 60);
-  // pull queue toward target so scenario stays coherent, plus flow + noise
-  s.queue += net + (tgt.queue - s.queue) * 0.12 + noise(0.8);
-  s.queue = Math.max(0, s.queue);
-
-  const prevQueue = Math.round(s.history[s.history.length - 1]?.queue ?? s.queue);
-  const occ = (s.queue / CAPACITY) * 100;
-  const state = classify(occ);
-  const nowQueue = Math.round(s.queue);
-
-  // congestion timer
-  if (occ >= 80) {
-    if (s.congestionSince == null) s.congestionSince = s.now;
-  } else {
-    s.congestionSince = null;
-  }
-
-  // events on state change — operator-facing language, no engineering names
-  if (state !== s.lastState) {
-    const sev =
-      state === "BACKLOG"
-        ? "critical"
-        : state === "CONGESTED"
-          ? "warn"
-          : state === "NORMAL"
-            ? "good"
-            : "info";
-    s.events.unshift({
-      id: ++s.eventId,
-      t: s.now,
-      kind: "state",
-      severity: sev as QueueEvent["severity"],
-      label: "Queue status changed",
-      detail: `${s.lastState} → ${state}`,
-    });
-    if ((state === "CONGESTED" || state === "BACKLOG") && s.lastState !== "BACKLOG") {
-      s.events.unshift({
-        id: ++s.eventId,
-        t: s.now,
-        kind: "congestion",
-        severity: state === "BACKLOG" ? "critical" : "warn",
-        label: state === "BACKLOG" ? "Queue backlog forming" : "Congestion detected",
-        detail: `${occ.toFixed(0)}% occupancy`,
-      });
-    }
-    if ((state === "BUSY" || state === "NORMAL") && (s.lastState === "CONGESTED" || s.lastState === "BACKLOG")) {
-      s.events.unshift({
-        id: ++s.eventId,
-        t: s.now,
-        kind: "congestion",
-        severity: "good",
-        label: "Queue beginning to clear",
-      });
-    }
-    s.lastState = state;
-  }
-
-  // occasional passenger flow events with queue-count transition
-  if (Math.random() < 0.5 && nowQueue !== prevQueue) {
-    const entering = nowQueue > prevQueue;
-    s.events.unshift({
-      id: ++s.eventId,
-      t: s.now,
-      kind: entering ? "entry" : "exit",
-      severity: "info",
-      label: entering ? "Passenger entered queue" : "Passenger cleared screening",
-      detail: `${prevQueue} → ${nowQueue}`,
-    });
-  }
-  if (degraded && Math.random() < 0.15) {
-    s.events.unshift({
-      id: ++s.eventId,
-      t: s.now,
-      kind: "system",
-      severity: "warn",
-      label: "Camera image quality reduced",
-    });
-  }
-
-  if (s.events.length > 60) s.events.length = 60;
-
-  s.history.push({
-    t: s.now,
-    queue: Math.round(s.queue),
-    occupancy: +occ.toFixed(1),
-    entryRate: +s.entry.toFixed(1),
-    exitRate: +s.exit.toFixed(1),
-    avgWait: +(s.queue / Math.max(s.exit, 0.5)).toFixed(1),
-  });
-  if (s.history.length > HISTORY_LEN) s.history.shift();
-  return s;
-}
-
-function tracksFor(queue: number, degraded: boolean): Track[] {
-  const n = Math.min(12, Math.max(0, Math.round(queue / 4)));
-  const out: Track[] = [];
-  for (let i = 0; i < n; i++) {
-    const col = i % 3;
-    const row = Math.floor(i / 3);
-    out.push({
-      id: 2200 + i,
-      x: 0.18 + col * 0.22 + noise(0.02),
-      y: 0.26 + row * 0.17 + noise(0.02),
-      w: 0.11,
-      h: 0.2,
-      inRoi: !degraded || Math.random() > 0.3,
-    });
-  }
-  return out;
-}
-
-function build(s: SimState, scenario: Scenario): Snapshot {
-  const offline = scenario === "OFFLINE";
-  const degraded = scenario === "DEGRADED";
-  const last = s.history[s.history.length - 1];
-  const occ = last.occupancy;
-  const state = classify(occ);
-  const net = +(last.entryRate - last.exitRate).toFixed(1);
-  const trend = net > 1 ? "GROWING" : net < -1 ? "CLEARING" : "STEADY";
-  const congestionSec = s.congestionSince ? Math.round((s.now - s.congestionSince) / 1000) : 0;
-  const avgWait = last.avgWait;
-  const longestWait = +(avgWait * 1.7 + 0.8).toFixed(1);
-  const serviceTimeS = +(60 / Math.max(last.exitRate, 0.5)).toFixed(1);
-  const predictedWait = +(last.queue * (serviceTimeS / 60)).toFixed(1);
-  const clearanceTime = predictedWait;
-  const pacingStatus =
-    last.queue === 0
-      ? "IDLE"
-      : serviceTimeS <= 15
-        ? "OPTIMAL"
-        : serviceTimeS > 35
-          ? "SLOW_INSPECTION"
-          : "STEADY";
-
-  const camera: CameraHealth = offline
-    ? {
-        link: "OFFLINE",
-        fps: 0,
-        resolution: "1920×1080",
-        latencyMs: 0,
-        packetLoss: 100,
-        lastFrameAgeMs: 8400,
-        uptimeSec: s.uptimeSec,
-        sourceLabel: "CAM-01",
-        sourceIndex: 0,
-        rotationDeg: 0,
-      }
-    : {
-        link: degraded ? "DEGRADED" : "ONLINE",
-        fps: degraded ? +(11 + noise(3)).toFixed(0) : +(24 + noise(1)).toFixed(0),
-        resolution: "1920×1080",
-        latencyMs: degraded ? Math.round(180 + noise(60)) : Math.round(62 + noise(18)),
-        packetLoss: degraded ? +(3.4 + noise(1)).toFixed(1) : +(0.1 + Math.random() * 0.2).toFixed(1),
-        lastFrameAgeMs: degraded ? Math.round(280 + noise(120)) : Math.round(48 + noise(20)),
-        uptimeSec: s.uptimeSec,
-        sourceLabel: "CAM-01",
-        sourceIndex: 0,
-        rotationDeg: 0,
-      };
-
-  const cv: CvHealth = offline
-    ? {
-        detection: "STALLED",
-        tracking: "STALLED",
-        analytics: "STALLED",
-        inferenceMs: 0,
-        model: "YOLOv5s",
-        tracker: "SORT",
-        detections: 0,
-        activeTracks: 0,
-        device: "Simulated",
-      }
-    : {
-        detection: degraded ? "DEGRADED" : "OK",
-        tracking: degraded ? "DEGRADED" : "OK",
-        analytics: degraded ? "DEGRADED" : "OK",
-        inferenceMs: degraded ? +(58 + noise(14)).toFixed(0) : +(27 + noise(6)).toFixed(0),
-        model: "YOLOv5s",
-        tracker: "SORT",
-        detections: offline ? 0 : Math.min(14, Math.round(last.queue / 3) + 2),
-        activeTracks: offline ? 0 : Math.min(12, Math.round(last.queue / 4)),
-        device: "Simulated",
-      };
-
-  return {
-    scenario,
-    state,
-    stateActive: !offline,
-    reason: offline
-      ? "Camera signal lost: queue analytics unavailable"
-      : degraded
-        ? `Degraded vision pipeline: readings low-confidence · ${reasonFor(state, net, occ)}`
-        : reasonFor(state, net, occ),
-    queue: last.queue,
-    capacity: CAPACITY,
-    occupancy: occ,
-    congestionSec,
-    entryRate: last.entryRate,
-    exitRate: last.exitRate,
-    netChange: net,
-    trend,
-    avgWait,
-    longestWait,
-    predictedWait,
-    clearanceTime,
-    serviceTimeS,
-    pacingStatus,
-    throughput: Math.round(last.exitRate * 60),
-    action: offline ? undefined : SIM_ACTIONS[state],
-    camera,
-    cv,
-    recording: { active: !offline, sinceSec: s.recSinceSec, sizeGb: +(s.recSinceSec / 3600 * 2.1).toFixed(1) },
-    lastKnownQueue: last.queue,
-    lastUpdate: last.t,
-    history: [...s.history],
-    events: [...s.events],
-    tracks: offline ? [] : tracksFor(last.queue, degraded),
-    frameTs: s.now,
-  };
-}
-
-export function useTelemetry(scenario: Scenario) {
-  const [snap, setSnap] = useState<Snapshot | null>(null);
-  const sim = useRef<SimState | null>(null);
-  const scenRef = useRef<Scenario>(scenario);
-
-  // reseed when scenario changes
-  useEffect(() => {
-    scenRef.current = scenario;
-    sim.current = seed(scenario);
-    setSnap(build(sim.current, scenario));
-  }, [scenario]);
-
-  useEffect(() => {
-    const id = setInterval(() => {
-      if (!sim.current) return;
-      sim.current = step(sim.current, scenRef.current);
-      setSnap(build(sim.current, scenRef.current));
-    }, TICK_MS);
-    return () => clearInterval(id);
-  }, []);
-
-  return snap;
-}
-
-export { CAPACITY };
 
 // ─────────────────────────────────────────────────────────────────────────
 // Real API telemetry hook — polls the FastAPI backend
@@ -536,41 +186,57 @@ export { CAPACITY };
 
 const POLL_INTERVAL_MS = 1000;
 
-function convertApiSnapshot(api: SnapshotResponse): Snapshot {
+/** Derive the frontend connectivity from the backend's availability fields. */
+export function deriveConnection(api: SnapshotResponse): Connection {
+  // The backend knows best what the capture supervisor is doing.
+  const status = api.camera.status;
+  if (status === "RECONNECTING") return "RECONNECTING";
+  if (status === "NO_FRAMES") return "NO_FRAMES";
+  if (status === "OFFLINE" || api.camera.link === "OFFLINE" || api.scenario === "OFFLINE")
+    return "CAMERA_OFFLINE";
+  if (api.scenario === "NO_DATA") return "NO_DATA";
+  if (api.scenario === "DEGRADED" || api.camera.link === "DEGRADED") return "DEGRADED";
+  return "LIVE";
+}
+
+export function convertApiSnapshot(api: SnapshotResponse): Snapshot {
   const queue = api.queue;
   const camera = api.camera;
   const cv = api.system;
 
   return {
-    scenario: api.scenario as Scenario,
+    connection: deriveConnection(api),
     state: queue.state,
     stateActive: queue.state_active,
     reason: queue.reason,
-    queue: queue.queue,
+    queue: queue.queue ?? null,
     capacity: queue.capacity,
-    occupancy: queue.occupancy,
-    congestionSec: queue.congestion_sec,
-    entryRate: queue.entry_rate,
-    exitRate: queue.exit_rate,
-    netChange: queue.net_change,
-    trend: queue.trend,
-    avgWait: queue.avg_wait,
-    longestWait: queue.longest_wait,
-    predictedWait: queue.predicted_wait,
-    clearanceTime: queue.clearance_time,
-    serviceTimeS: queue.service_time_s,
-    pacingStatus: queue.pacing_status,
-    throughput: queue.throughput,
-    action: queue.action,
+    occupancy: queue.occupancy ?? null,
+    congestionSec: queue.congestion_sec ?? null,
+    entryRate: queue.entry_rate ?? null,
+    exitRate: queue.exit_rate ?? null,
+    netChange: queue.net_change ?? null,
+    trend: queue.trend ?? null,
+    avgWait: queue.avg_wait ?? null,
+    longestWait: queue.longest_wait ?? null,
+    predictedWait: queue.predicted_wait ?? null,
+    clearanceTime: queue.clearance_time ?? null,
+    serviceTimeS: queue.service_time_s ?? null,
+    pacingStatus: queue.pacing_status ?? null,
+    throughput: queue.throughput ?? null,
+    action: queue.action ?? null,
     camera: {
       link: camera.link,
+      status: camera.status ?? "",
       fps: camera.fps,
       resolution: camera.resolution,
       latencyMs: camera.latency_ms,
       packetLoss: camera.packet_loss,
       lastFrameAgeMs: camera.last_frame_age_ms,
       uptimeSec: camera.uptime_sec,
-      sourceLabel: camera.source_label || "CAM-01",
+      // No fabricated identifier: when the pipeline has not reported one,
+      // the console shows a neutral placeholder instead of "CAM-01".
+      sourceLabel: camera.source_label || "",
       sourceIndex: camera.source_index,
       rotationDeg: camera.rotation_deg ?? 0,
     },
@@ -590,7 +256,7 @@ function convertApiSnapshot(api: SnapshotResponse): Snapshot {
       sinceSec: api.recording.since_sec,
       sizeGb: api.recording.size_gb,
     },
-    lastKnownQueue: api.last_known_queue,
+    lastKnownQueue: api.last_known_queue ?? null,
     lastUpdate: api.last_update,
     history: api.history.map((h) => ({
       t: h.t,
@@ -621,25 +287,31 @@ function convertApiSnapshot(api: SnapshotResponse): Snapshot {
   };
 }
 
-export function createOfflineSnapshot(errorMsg = "API disconnected"): Snapshot {
+/**
+ * An explicit "no data" snapshot: every measurement is null, the state is
+ * DATA_UNAVAILABLE, and connectivity says which link is missing. Nothing
+ * here is a fabricated value.
+ */
+export function createUnavailableSnapshot(connection: Connection, reason: string): Snapshot {
   return {
-    scenario: "OFFLINE",
-    state: "NORMAL",
+    connection,
+    state: "DATA_UNAVAILABLE",
     stateActive: false,
-    reason: `Backend offline: ${errorMsg}`,
-    queue: 0,
-    capacity: 30,
-    occupancy: 0,
-    congestionSec: 0,
-    entryRate: 0,
-    exitRate: 0,
-    netChange: 0,
-    trend: "STEADY",
-    avgWait: 0,
-    longestWait: 0,
-    throughput: 0,
+    reason,
+    queue: null,
+    capacity: 30, // config default; only used for scale once readings exist
+    occupancy: null,
+    congestionSec: null,
+    entryRate: null,
+    exitRate: null,
+    netChange: null,
+    trend: null,
+    avgWait: null,
+    longestWait: null,
+    throughput: null,
     camera: {
       link: "OFFLINE",
+      status: connection === "RECONNECTING" || connection === "NO_FRAMES" ? connection : "OFFLINE",
       fps: 0,
       resolution: "-",
       latencyMs: null,
@@ -662,28 +334,46 @@ export function createOfflineSnapshot(errorMsg = "API disconnected"): Snapshot {
       device: "",
     },
     recording: { active: false, sinceSec: null, sizeGb: null },
-    lastKnownQueue: 0,
-    lastUpdate: Date.now(),
+    lastKnownQueue: null,
+    lastUpdate: 0,
     history: [],
     events: [],
     tracks: [],
-    frameTs: Date.now(),
+    frameTs: 0,
   };
 }
 
 export function useRealTelemetry(pollInterval = POLL_INTERVAL_MS) {
-  const [snap, setSnap] = useState<Snapshot>(() => createOfflineSnapshot("Connecting to YOLO backend..."));
+  const [snap, setSnap] = useState<Snapshot>(() =>
+    createUnavailableSnapshot("NO_DATA", "Connecting to backend..."),
+  );
   const [error, setError] = useState<string | null>(null);
+  const [connected, setConnected] = useState(false);
+  // Last successful reading, so a poll blip marks the console unreachable
+  // instead of blanking it (and vice versa: recovery needs no reload).
+  const lastGood = useRef<Snapshot | null>(null);
 
   const fetchOnce = useCallback(async () => {
     try {
       const apiSnap = await getSnapshot();
-      setSnap(convertApiSnapshot(apiSnap));
+      const converted = convertApiSnapshot(apiSnap);
+      lastGood.current = converted;
+      setSnap(converted);
       setError(null);
+      setConnected(true);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to fetch telemetry";
       setError(msg);
-      setSnap(createOfflineSnapshot(msg));
+      setConnected(false);
+      setSnap((prev) => {
+        const base = lastGood.current ?? prev;
+        return {
+          ...base,
+          connection: "BACKEND_UNAVAILABLE",
+          stateActive: false,
+          reason: `Backend unreachable: ${msg}`,
+        };
+      });
     }
   }, []);
 
@@ -693,7 +383,8 @@ export function useRealTelemetry(pollInterval = POLL_INTERVAL_MS) {
     return () => clearInterval(id);
   }, [fetchOnce, pollInterval]);
 
-  return { snap, error, refetch: fetchOnce };
+  /** Manual retry: re-poll now (also used by the header Retry control). */
+  return { snap, error, connected, refetch: fetchOnce };
 }
 
 // ─────────────────────────────────────────────────────────────────────────

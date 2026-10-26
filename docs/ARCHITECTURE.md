@@ -36,14 +36,14 @@ YOLOv5s (COCO person) ──► SORT (stable IDs, Kalman + IoU)
         FastAPI :8080  ── /api/* , /api/dashboard/* , /api/camera/stream
              │ Vite proxy (/api → :8080)
              ▼
-        React dashboard :8443  (LIVE mode = API, DEMO mode = simulator)
+        React dashboard :8443  (presentation only: polls :8080, no queue logic)
 ```
 
 ## Module Responsibilities
 
 | Module | Responsibility | Must NOT |
 |--------|----------------|----------|
-| `app/detect_people.py` | CLI, FrameStream capture, YOLO inference, main loop, hot-reload polling, rendering | Own queue business logic |
+| `app/detect_people.py` | CLI, FrameStream capture, YOLO inference, main loop, capture supervisor (bounded camera reconnect), hot-reload polling, rendering | Own queue business logic |
 | `app/sort_tracker.py` | Tracking (Kalman + IoU + Hungarian) | Detect, classify |
 | `app/queue_prototype.py` | QueueAnalytics, RuleClassifier, crossing engine, config loading, HUD | Render, serve HTTP |
 | `app/mapping.py` | Mapping schema, validation, normalised↔pixel conversion, atomic persistence | Detect, classify |
@@ -68,6 +68,7 @@ YOLOv5s (COCO person) ──► SORT (stable IDs, Kalman + IoU)
 | Snapshot as frozen dataclasses, shared via one locked holder | Pipeline writes at frame rate; HTTP readers must never see partial state |
 | Validation before persistence + atomic `os.replace` + `.bak` | A bad payload can never replace a working mapping |
 | Raw stream is opt-in (`?annotated=0`) | Existing annotated-stream consumers keep their burn-ins |
+| Camera failure is survivable: bounded reconnect, API stays up, honest unavailable states | The FastAPI service shares the process with the loop — a dead camera must degrade the reading, not kill the server |
 
 ## Data Flow: Backend → Dashboard
 
@@ -78,7 +79,12 @@ YOLOv5s (COCO person) ──► SORT (stable IDs, Kalman + IoU)
    `?points` up to 3600).
 3. Camera panel renders `GET /api/camera/stream` (MJPEG) and overlays are
    optional; the mapping editor uses `?annotated=0`.
-4. Simulator/DEMO mode bypasses all of this with synthetic telemetry.
+4. Camera failure never stops this chain: the capture supervisor in
+   `detect_people.py` reconnects with bounded backoff (up to 5 attempts,
+   waits 1/2/4/8 s between them, then stops and waits for a manual source
+   selection) while the API keeps serving snapshots that carry explicit
+   unavailable states. There is no synthetic data source anywhere in the
+   console.
 
 Field-level contracts: [API.md](API.md).
 

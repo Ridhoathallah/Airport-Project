@@ -263,14 +263,34 @@ class TestSelectEndpoint(_TempEnvTestCase):
         self.RUNNING_INDEX = 2
         # Subclass-level fixture trick does not apply per-method; run the
         # scenario directly with the running index patched on the holder.
+        # The snapshot must look like a LIVE camera (link ONLINE): that is
+        # the only case where "already running" is a truthful no-op.
         with patch("api_server.get_holder") as mock_holder:
             snap = type("Snap", (), {"camera_state": type(
-                "Cam", (), {"source_index": 2})()})()
+                "Cam", (), {"source_index": 2, "link": "ONLINE"})()})()
             mock_holder.return_value.get_latest_snapshot.return_value = snap
             resp = client.post("/api/dashboard/camera/select", json={"index": 2})
         data = resp.json()
         self.assertIs(data["applied"], True)
         self.assertEqual(camera_control.consume_camera_control(), ("", {}, ""))
+
+    def test_select_running_index_retries_when_camera_offline(self):
+        """With the camera offline, re-selecting it is the manual retry.
+
+        The no-op shortcut must not swallow the request: a switch to the
+        same index has to reach the loop so it re-opens the device.
+        """
+        with patch("api_server.get_holder") as mock_holder, \
+                patch("detect_people.probe_camera_index", return_value=(True, (640, 480))):
+            snap = type("Snap", (), {"camera_state": type(
+                "Cam", (), {"source_index": 2, "link": "OFFLINE"})()})()
+            mock_holder.return_value.get_latest_snapshot.return_value = snap
+            resp = client.post("/api/dashboard/camera/select", json={"index": 2})
+        data = resp.json()
+        self.assertIs(data["applied"], True)
+        action, payload, _src = camera_control.consume_camera_control()
+        self.assertEqual(action, "switch")
+        self.assertEqual(payload.get("source"), "2")
 
     def test_select_out_of_range_rejected(self):
         resp = client.post("/api/dashboard/camera/select", json={"index": 99})

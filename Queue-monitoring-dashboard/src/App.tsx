@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { useTelemetry, useRealTelemetry, useCameraConfig, type Scenario } from "./lib/telemetry";
+import { Sun, Moon } from "lucide-react";
+import { useRealTelemetry, useCameraConfig } from "./lib/telemetry";
 import { shutdownApi } from "./lib/api";
 import {
   QueueStatusPanel,
@@ -11,8 +12,6 @@ import {
 } from "./components/sections";
 import { OperatorHealth, DiagnosticsDrawer } from "./components/health";
 
-export type AppMode = "live" | "demo";
-
 /**
  * Airport X-Ray Queue Monitoring System
  *
@@ -20,31 +19,42 @@ export type AppMode = "live" | "demo";
  * and answers the operator's first question, the camera feed supports it,
  * and the right column holds the flow, trend and waiting time detail.
  *
+ * All telemetry comes from the backend; the console only presents it.
+ * Connectivity (backend reachable, camera delivering) is tracked separately
+ * from the queue condition, which is always the classifier's own answer.
+ *
  * At 1440x900 and above the console fills the viewport without scrolling.
  * Below that the panels stack and the page scrolls, which keeps every
  * reading reachable instead of squeezing the controls off screen.
  */
 export default function App() {
-  const [mode, setMode] = useState<AppMode>("live");
-  const [scenario, setScenario] = useState<Scenario>("NORMAL");
   const [drawer, setDrawer] = useState(false);
   const [range, setRange] = useState("15m");
   const [clock, setClock] = useState(Date.now());
+  // Dark is the default; the inline script in index.html has already applied
+  // a persisted light choice before this renders.
+  const [theme, setTheme] = useState<"dark" | "light">(() =>
+    document.documentElement.classList.contains("light") ? "light" : "dark",
+  );
 
-  const simSnap = useTelemetry(scenario);
-  const { snap: apiSnap, error: apiError, refetch } = useRealTelemetry();
+  const toggleTheme = () => {
+    const next = theme === "dark" ? "light" : "dark";
+    document.documentElement.classList.toggle("light", next === "light");
+    try {
+      localStorage.setItem("theme", next);
+    } catch {
+      /* storage unavailable: the theme still applies for this session */
+    }
+    setTheme(next);
+  };
+
+  const { snap: s, error: apiError, refetch } = useRealTelemetry();
   const [camConfig, refreshCamConfig] = useCameraConfig();
-
-  const isLive = mode === "live";
-  const s = isLive ? apiSnap : simSnap;
-  const dataSource = isLive ? "api" : "simulator";
 
   useEffect(() => {
     const id = setInterval(() => setClock(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
-
-  if (!s) return <div className="size-full bg-brand-tertiary" />;
 
   const onShutdown = () => {
     if (window.confirm("Shut down the detection pipeline and API server?")) {
@@ -70,11 +80,20 @@ export default function App() {
         </div>
 
         <div className="flex shrink-0 items-center gap-md">
-          {isLive && apiError && (
+          <button
+            type="button"
+            className="ctl h-7 w-7 justify-center px-0"
+            onClick={toggleTheme}
+            aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+          >
+            {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
+          </button>
+          {apiError && (
             <div className="flex items-center gap-xs rounded-corner-sm border border-control px-sm py-1">
               <span className="h-1.5 w-1.5 rounded-full" style={{ background: "var(--st-busy)" }} aria-hidden />
               <span className="text-[11px] font-semibold" style={{ color: "var(--st-busy)" }}>
-                Reconnecting
+                Backend unreachable
               </span>
               <button
                 type="button"
@@ -110,7 +129,7 @@ export default function App() {
             left column would overflow into the right one. */}
         <div className="flex flex-col gap-md xl:min-h-0">
           <QueueStatusPanel s={s} />
-          <CameraPanel s={s} dataSource={dataSource} config={camConfig} onConfigChanged={refreshCamConfig} />
+          <CameraPanel s={s} config={camConfig} onConfigChanged={refreshCamConfig} />
         </div>
 
         <div className="flex flex-col gap-md xl:min-h-0">
@@ -132,10 +151,6 @@ export default function App() {
         open={drawer}
         onClose={() => setDrawer(false)}
         config={camConfig}
-        dataSource={dataSource}
-        onDataSource={(ds) => setMode(ds === "api" ? "live" : "demo")}
-        scenario={scenario}
-        onScenario={setScenario}
         onShutdown={onShutdown}
       />
     </div>

@@ -5,6 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Airport X-Ray Queue Monitoring System</title>
     <meta name="description" content="Airport security checkpoint queue monitoring dashboard" />
+    <script>
+      /* Apply the persisted theme before first paint so a light-theme
+         reload never flashes the dark default. Dark is the default. */
+      try {
+        if (localStorage.getItem("theme") === "light") {
+          document.documentElement.classList.add("light");
+        }
+      } catch (e) {
+        /* storage unavailable: keep the default dark theme */
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

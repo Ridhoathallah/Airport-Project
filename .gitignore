@@ -49,6 +49,7 @@ datasets/*/labels/
 
 # ── Operational runtime output: recordings, logs, captures ───
 output/
+.run/
 *.log
 *.jsonl.bak
 
@@ -86,6 +87,17 @@ live-api-final.png
 .env
 .env.*
 !.env.example
+
+# Key / credential material (defense in depth: none of these
+# files exist in the project — the rules make sure it stays that way)
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+*.mobileprovision
 
 # ── Database files (except into the analytics pipeline) ──────
 *.db

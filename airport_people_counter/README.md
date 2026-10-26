@@ -79,7 +79,6 @@ make test
 | `--roi-preview` | off | Preview saved layout |
 | `--debug` | off | Show classifier reasons on HUD |
 | `--legacy-hud` | off | Use legacy full-frame HUD |
-| `--monitor` | off | **LEGACY** Enable core/ engine |
 
 ## Configuration
 
@@ -155,7 +154,7 @@ make smoke         # Offline image test
 ```
 
 The suite is written in two styles, so `make test` invokes both runners:
-`unittest discover` (262 `TestCase` tests) and `pytest` (308 tests, which
+`unittest discover` (308 `TestCase` tests) and `pytest` (358 tests, which
 also collects the pytest-style function tests unittest skips: the history
 buffer, the dashboard adapter, the dashboard API, the dashboard models and
 the event language). `make test-unittest` and `make test-pytest` run one
@@ -183,8 +182,9 @@ See [../docs/DATASETS.md](../docs/DATASETS.md) for the full workflow.
 
 - **No facial recognition** — Tracks people, doesn't identify them
 - **Camera-only prototype** — No sensor fusion, no cloud, local-only
-- **Backend = Source of Truth** — Dashboard only presents API data
-- **Simulator ≠ Production** — "Simulator" source is synthetic data only
+- **Backend = Source of Truth** — Dashboard only presents API data; a
+  camera failure keeps the API alive (bounded reconnect) and reports
+  honest unavailable states instead of fabricated numbers
 
 ---
 

@@ -12,7 +12,7 @@ camera:
 
   # Camera source: webcam index ("0", "1", ...), video file path,
   # image path, or RTSP/HTTP URL.  CLI --source overrides this value.
-  source: '0'
+  source: '1'
 
   # Capture resolution requested from the camera. 0 = use the camera's
   # native resolution (recommended: keeps the source sharp). If the camera

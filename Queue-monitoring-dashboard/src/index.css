@@ -11,9 +11,11 @@
 
   Design decisions and why they are here:
 
-  - Fixed dark surface. The console runs 24/7 on a wall display in a dim
-    checkpoint office, so the surface is always dark rather than following the
-    OS theme.
+  - Dark surface is the default. The console runs 24/7 on a wall display in a
+    dim checkpoint office, so dark stays the default rather than following
+    the OS theme; a persistent operator-selectable light theme lives in
+    `:root.light` for bright offices, chosen in the header and remembered
+    across reloads.
   - Navy-blue neutrals, not neutral grey. Airport wayfinding and AODB
     conventions use a blue-grey operational palette; it also separates the
     console from a generic "dark dashboard".
@@ -31,6 +33,8 @@
 
 :root,
 :root.dark {
+  color-scheme: dark;
+
   /* ── Surfaces ────────────────────────────────────────────────────────────
      Four steps only. Depth comes from surface steps, not from shadows. */
   --brand-tertiary: #0b1220; /* page canvas */
@@ -97,6 +101,61 @@
   --corner-md: 6px;
   --corner-lg: 10px;
   --corner-full: 999px;
+}
+
+/*
+  Light theme. Same structure and semantics as the dark tokens above, only
+  the surfaces, borders, text and status/chart colours change: a navy-tinted
+  paper palette for bright offices. Dark remains the default; this block is
+  applied by toggling the `light` class on :root (persisted in localStorage,
+  set before first paint by the inline script in index.html).
+*/
+:root.light {
+  color-scheme: light;
+
+  /* ── Surfaces ────────────────────────────────────────────────────────────
+     The same four steps, inverted: depth still comes from surface steps. */
+  --brand-tertiary: #eef2f8; /* page canvas */
+  --surface-bg: #ffffff; /* panel */
+  --bg-faint: #ffffff;
+  --bg-subtle: #e9eef6; /* meter track, inset wells */
+  --bg-hover: #e3eaf4;
+  --surface-hover: #e3eaf4;
+  --surface-secondary-bg: #f5f8fc; /* raised tile */
+  --surface-dark: #f5f8fc;
+  --surface-dark-hover: #e3eaf4;
+  --input-bg: #ffffff;
+
+  /* ── Borders ─────────────────────────────────────────────────────────────
+     --border-control clears 3:1 against the light canvas. */
+  --border-primary: #d4ddeb;
+  --border-secondary: #d4ddeb;
+  --border-control: #6f8098;
+  --border-selected: #0a5fd0;
+
+  /* ── Text ────────────────────────────────────────────────────────────────
+     All three clear 4.5:1 on every surface used in the console. */
+  --text-primary: #101a2b;
+  --text-secondary: #41506a;
+  --text-tertiary: #5b6b85;
+
+  --modal-scrim: #0b122099;
+
+  /* ── Status ──────────────────────────────────────────────────────────────
+     Same semantics, darkened so each clears contrast on the light surface. */
+  --st-normal: #1a7f37;
+  --st-busy: #9a6700;
+  --st-congested: #bc4c00;
+  --st-backlog: #cf222e;
+  --st-offline: #59636e;
+  --st-info: #0a5fd0;
+
+  /* ── Data series ─────────────────────────────────────────────────────────
+     Entries / exits / queue length. */
+  --chart-entry: #0a5fd0;
+  --chart-exit: #0d8a7d;
+  --chart-queue: #334155;
+  --chart-wait: #0369a1;
 }
 
 html,

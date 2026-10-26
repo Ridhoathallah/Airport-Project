@@ -170,6 +170,166 @@ DISPLAY_WIDTH = 960
 # Show the raw people/px² value on the panel (clearly labelled uncalibrated).
 SHOW_RAW_DENSITY = False
 
+# ── Camera lifecycle (resilient capture) ───────────────────────────────
+# Live sources (webcam / IP stream) get bounded automatic recovery so a
+# camera failure never terminates the process (the FastAPI service runs
+# in the same process and must survive the camera). After
+# MAX_RECONNECT_ATTEMPTS consecutive failures the pipeline stops
+# retrying on its own and waits for a manual retry (dashboard camera
+# controls, a config reload, or a process restart) — there is no
+# uncontrolled retry loop.
+CAMERA_MAX_RECONNECT_ATTEMPTS = 5
+#: Backoff before reconnect attempt 1..N (seconds).
+CAMERA_RECONNECT_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 15.0)
+# A live source that stops delivering frames for this long without
+# failing a read is treated as lost (macOS cameras wedged by another
+# process deliver nothing without ever erroring).
+CAMERA_STALL_TIMEOUT_S = 20.0
+# How long to wait for the first frame after a (re)open before treating
+# the source as opened-but-silent.
+CAMERA_FIRST_FRAME_TIMEOUT_S = 10.0
+# Camera-offline snapshot publishing interval (~1 Hz) so the API keeps
+# reporting the camera state honestly while no frames flow.
+CAMERA_OFFLINE_PUBLISH_INTERVAL_S = 1.0
+
+#: Image extensions recognised as single-shot sources (fail-fast).
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+#: URL schemes that mean a live stream (reconnectable).
+STREAM_PREFIXES = ("http://", "https://", "rtsp://")
+
+
+class CameraOpenError(ValueError):
+    """A camera source could not be opened, or opened without frames.
+
+    ``delivered_frames`` distinguishes "opened but delivered nothing"
+    (device present but silent: permission off, wedged daemon, dead
+    stream) from "could not open at all" (device missing or busy), so
+    the recovery logic and the reported camera status can differ.
+    Subclasses ValueError so existing handlers keep working.
+    """
+
+    def __init__(self, message: str, delivered_frames: bool = False):
+        super().__init__(message)
+        self.delivered_frames = delivered_frames
+
+
+def safe_source(source) -> str:
+    """Source text that is safe to log or put in an event.
+
+    Credentials embedded in a stream URL (rtsp://user:pass@host/...) are
+    masked, so actionable failure reasons never leak secrets into logs,
+    events, or the dashboard.
+    """
+    text = str(source)
+    for scheme in STREAM_PREFIXES:
+        if text.startswith(scheme):
+            rest = text[len(scheme):]
+            if "@" in rest:
+                return f"{scheme}***@{rest.split('@', 1)[1]}"
+            return text
+    return text
+
+
+def is_live_source(source) -> bool:
+    """True for sources that represent a camera (webcam index or stream
+    URL) — the sources that get bounded reconnection. Files and images
+    are deterministic inputs and keep their fail-fast semantics."""
+    text = str(source)
+    return text.isdigit() or text.startswith(STREAM_PREFIXES)
+
+
+def _open_live_stream(source, camera_config):
+    """Open and start a FrameStream, waiting for its first frame.
+
+    Returns ``(stream, None, "")`` on success, or
+    ``(None, reason, status_flag)`` on failure, where ``status_flag`` is
+    "NO_FRAMES" (source opened but stayed silent) or "OFFLINE" (source
+    could not be opened at all). Never raises; the caller decides what
+    recovery looks like. The reason is operator-safe (credentials
+    masked, no stack trace).
+    """
+    try:
+        stream = FrameStream(
+            source,
+            width=camera_config.width,
+            height=camera_config.height,
+            rotation=camera_config.rotation,
+        ).start()
+    except CameraOpenError as exc:
+        flag = "NO_FRAMES" if exc.delivered_frames else "OFFLINE"
+        return None, f"{safe_source(source)}: {exc}", flag
+    except (ValueError, OSError) as exc:
+        return None, f"{safe_source(source)}: {exc}", "OFFLINE"
+
+    # The first frame must arrive, otherwise the next read can see
+    # (None, gen) and be mistaken for the end of a video file.
+    frame, _ = stream.read()
+    deadline = time.monotonic() + CAMERA_FIRST_FRAME_TIMEOUT_S
+    while frame is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+        frame, _ = stream.read()
+    if frame is None:
+        stream.release()
+        return (
+            None,
+            f"{safe_source(source)}: opened but delivered no frames "
+            f"within {CAMERA_FIRST_FRAME_TIMEOUT_S:.0f}s",
+            "NO_FRAMES",
+        )
+    return stream, None, ""
+
+
+def _offline_system_metrics(last_system, camera_status, camera_config,
+                            source_label, source_index):
+    """SystemMetrics for a pipeline whose camera is not delivering.
+
+    Frame-derived numbers are zeroed (no frames = no inference, no
+    detections) while the real last-frame clock and camera lifecycle
+    state are carried over, so the snapshot can report the true age of
+    the newest frame and the honest camera status.
+    """
+    base = last_system if last_system is not None else SystemMetrics()
+    return SystemMetrics(
+        fps=0.0,
+        inference_ms=base.inference_ms,
+        tracking_ms=base.tracking_ms,
+        analytics_ms=base.analytics_ms,
+        render_ms=0.0,
+        capture_fps=0.0,
+        frame_count=base.frame_count,
+        detections=0,
+        tracks=0,
+        source=source_label,
+        device=DEVICE,
+        img_size=IMG_SIZE,
+        last_frame_unix=base.last_frame_unix,
+        source_index=source_index,
+        source_label=source_label,
+        rotation_deg=camera_config.rotation,
+        frame_w=0,
+        frame_h=0,
+        camera_status=camera_status,
+    )
+
+
+def _publish_camera_offline(camera_config, system, recent_events,
+                            last_analytics_snap):
+    """Publish an honest camera-offline snapshot to the API holder.
+
+    With a previous analytics reading the frozen last-known queue values
+    ride along (the adapter holds them as "last known"); without one the
+    snapshot is an explicit DATA_UNAVAILABLE / all-null reading. Nothing
+    is recomputed from missing frames, so no queue number is ever
+    fabricated while the camera is down.
+    """
+    holder = get_holder()
+    if last_analytics_snap is not None:
+        dash = build_dashboard_model(last_analytics_snap, system, camera_config, recent_events)
+        snap, _ = SnapshotBuilder.build(dash, system, camera_config, [], recent_events, None)
+    else:
+        snap = SnapshotBuilder.build_offline(camera_config, system, recent_events)
+    holder.update(snap, None, raw_frame=None)
+
 # ─────────────────────────────────────────────────────────────
 
 
@@ -448,7 +608,7 @@ class FrameStream:
         self._rotation = normalize_rotation(rotation)
         self._cap = cv2.VideoCapture(src)
         if not self._cap.isOpened():
-            raise ValueError(f"Could not open source: {source}")
+            raise CameraOpenError(f"Could not open source: {safe_source(source)}")
 
         self._is_webcam = str(source).isdigit()
         self._is_file = (
@@ -510,12 +670,13 @@ class FrameStream:
             first = self._grab_first_frame(self._cap, timeout=2.0)
             if first is None:
                 self._cap.release()
-                raise ValueError(
-                    f"Camera source {source} opened but delivered no frames — "
+                raise CameraOpenError(
+                    f"Camera source {safe_source(source)} opened but delivered no frames — "
                     "macOS camera privacy permission may be off (System Settings → "
                     "Privacy & Security → Camera → enable your terminal app, then "
                     "relaunch), another app may be using the camera, or the stream "
-                    "is dead. Run --list-cameras to see available devices."
+                    "is dead. Run --list-cameras to see available devices.",
+                    delivered_frames=True,
                 )
             self.frame_w, self.frame_h = first.shape[1], first.shape[0]
 
@@ -597,6 +758,11 @@ class FrameStream:
         return self._rotation
 
     @property
+    def is_file(self) -> bool:
+        """True when the source is a video file (ends at EOF, no reconnect)."""
+        return self._is_file
+
+    @property
     def native_w(self) -> Optional[int]:
         """Delivered frame width before rotation (None until known)."""
         return self._native_w
@@ -671,6 +837,16 @@ def open_source(source, width=0, height=0, rotation=0):
 
     try:
         stream = FrameStream(source, width=width, height=height, rotation=rotation)
+    except CameraOpenError as exc:
+        # Preserve the typed error (and its delivered_frames flag) so the
+        # caller can tell "opened but silent" from "could not open".
+        raise CameraOpenError(
+            f"{exc}\n"
+            "  Hint: run --list-cameras to see available camera devices, try a "
+            "different --source index, and check macOS Camera privacy permission "
+            "(System Settings → Privacy & Security → Camera).",
+            delivered_frames=exc.delivered_frames,
+        ) from exc
     except ValueError as exc:
         raise ValueError(
             f"{exc}\n"
@@ -827,9 +1003,28 @@ def run_detection(source=0, camera_config=None, detect_mode=None,
     if detect_mode:
         camera_config.detect_mode = detect_mode.lower()
 
-    is_image, image, stream = open_source(
-        source, camera_config.width, camera_config.height, rotation=camera_config.rotation
-    )
+    source_str = str(source)
+    live_source = is_live_source(source_str)
+    is_image, image, stream = False, None, None
+    # Capture-supervisor state reported to the API ("OK" / "RECONNECTING"
+    # / "NO_FRAMES" / "OFFLINE"). Live sources never fail the process:
+    # the FastAPI service runs in the same one and must survive the camera.
+    camera_status = "OK"
+
+    if live_source:
+        stream, startup_err, startup_flag = _open_live_stream(source, camera_config)
+        if stream is None:
+            # Bounded retries start with the loop; the flag only colours
+            # the startup warning (opened-but-silent vs could-not-open).
+            camera_status = "RECONNECTING"
+            print(f"[WARN] Camera unavailable at startup ({startup_flag}): {startup_err}")
+    else:
+        # Images and video files are deterministic inputs: a missing or
+        # unreadable one is a configuration error, not a camera to
+        # reconnect to, so keep the fail-fast behaviour.
+        is_image, image, stream = open_source(
+            source, camera_config.width, camera_config.height, rotation=camera_config.rotation
+        )
 
     if str(source).isdigit():
         # Operator-facing chrome label: webcam index N → CAM-0(N+1).
@@ -844,18 +1039,31 @@ def run_detection(source=0, camera_config=None, detect_mode=None,
     # supported size when a specific resolution was requested).
     if is_image:
         cam_w, cam_h = image.shape[1], image.shape[0]
-    else:
-        assert stream is not None
+    elif stream is not None:
+        # Live sources already delivered their first frame inside
+        # _open_live_stream; file sources are started and waited for here
+        # (bounded — a file that never delivers is a config error).
         stream.start()
         frame, _ = stream.read()
-        while frame is None:
+        first_deadline = time.monotonic() + CAMERA_FIRST_FRAME_TIMEOUT_S
+        while frame is None and time.monotonic() < first_deadline:
             time.sleep(0.01)
             frame, _ = stream.read()
+        if frame is None:
+            raise RuntimeError(
+                f"Video source {safe_source(source)} did not deliver a frame "
+                f"within {CAMERA_FIRST_FRAME_TIMEOUT_S:.0f}s."
+            )
         cam_w, cam_h = (stream.frame_w or frame.shape[1]), (stream.frame_h or frame.shape[0])
+    else:
+        # Camera offline at startup: these dimensions are layout fallbacks
+        # only. No config value is overwritten from a frame that never
+        # arrived, and no measurement is invented.
+        cam_w, cam_h = camera_config.width or 1280, camera_config.height or 720
 
-    if camera_config.width <= 0:
+    if (is_image or stream is not None) and camera_config.width <= 0:
         camera_config.width = cam_w
-    if camera_config.height <= 0:
+    if (is_image or stream is not None) and camera_config.height <= 0:
         camera_config.height = cam_h
 
     scale = camera_config.display_scale if camera_config.display_scale > 0 else 1.0
@@ -874,6 +1082,8 @@ def run_detection(source=0, camera_config=None, detect_mode=None,
               f"  measured {stream.delivered_fps:.1f}" if stream.delivered_fps > 0 else "")
     elif not is_image and stream is not None:
         print(f"[INFO] Capture FPS  : measuring ...")
+    elif not is_image:
+        print(f"[INFO] Camera state : OFFLINE — bounded reconnect starts with the loop")
     print(f"[INFO] Display      : {disp_w}×{disp_h}  (display_scale {scale:.2f})")
     print(f"[INFO] Inference    : {IMG_SIZE}px  on {DEVICE}")
     print(f"[INFO] Detect mode  : {camera_config.detect_mode}")
@@ -961,8 +1171,10 @@ def run_detection(source=0, camera_config=None, detect_mode=None,
         return
 
     # ── VIDEO / WEBCAM MODE ───────────────────────────────────
-    assert stream is not None
-    stream.start()
+    # stream may be None here: a live source that failed to open at
+    # startup enters the loop straight into the reconnect supervisor.
+    if stream is not None:
+        stream.start()
 
     tracker = SortTracker(
         max_age=TRACK_MAX_AGE,
@@ -985,29 +1197,237 @@ def run_detection(source=0, camera_config=None, detect_mode=None,
             )
 
     # Wait for the first frame so the loop starts with a real image.
-    frame, last_gen = stream.read()
-    while frame is None:
-        time.sleep(0.01)
+    # Bounded: live sources already proved delivery during open; a file
+    # that stays silent is a config error, not a reconnect case.
+    frame, last_gen = None, None
+    if stream is not None:
         frame, last_gen = stream.read()
+        first_deadline = time.monotonic() + CAMERA_FIRST_FRAME_TIMEOUT_S
+        while frame is None and time.monotonic() < first_deadline:
+            time.sleep(0.01)
+            frame, last_gen = stream.read()
+        if frame is None:
+            if is_live_source(source):
+                stream.release()
+                stream = None
+                camera_status = "RECONNECTING"
+            else:
+                raise RuntimeError(
+                    f"Video source {safe_source(source)} did not deliver a frame "
+                    f"within {CAMERA_FIRST_FRAME_TIMEOUT_S:.0f}s."
+                )
 
     frame_budget = (1.0 / TARGET_FPS) if TARGET_FPS > 0 else 0.0
     next_frame_time = time.monotonic()
     recent_events = []
+    # Camera-lifecycle supervisor state (live sources): bounded reconnect
+    # attempts, backoff deadline, last offline-snapshot publish, and the
+    # last frame-derived models so an offline snapshot can hold the frozen
+    # last-known reading instead of inventing one.
+    reconnect_attempts = 0
+    next_reconnect_at = time.monotonic()
+    last_offline_publish = 0.0
+    last_analytics_snap = None
+    last_system = None
 
     while True:
         if shutdown_requested():
             print("\n[INFO] Shutdown requested -- stopping the detection loop.")
             break
+
+        # ── Config hot-reload & camera control (API-driven) ──────────
+        # Handled at the top of every iteration so they keep working while
+        # the camera is offline: switching source during an outage IS the
+        # manual retry. The endpoints validate and persist first, so a
+        # failed update never reaches this point. Rotation is one
+        # lane-level setting: it stays in effect across a source switch.
+        reload_source = consume_config_reload()
+        if reload_source:
+            camera_config = load_camera_config(camera_config.path or DEFAULT_CAMERA_CONFIG_PATH)
+            analytics.config = camera_config
+            analytics.reset_mapping()
+            print(
+                f"\n[INFO] Config reloaded via {reload_source} — "
+                f"mapping active: {camera_config.mapping_active}, "
+                f"ref: {getattr(getattr(camera_config, 'mapping', None), 'reference_point', 'n/a')}"
+            )
+
+        action, payload, ctl_src = consume_camera_control()
+        if action == "switch":
+            camera_config = load_camera_config(camera_config.path or DEFAULT_CAMERA_CONFIG_PATH)
+            target = str(payload.get("source", ""))
+            if not target:
+                print("[WARN] Camera switch request without a source — ignored.")
+            elif stream is not None and str(source) == target:
+                print(f"\n[INFO] Camera switch ignored — already on source {target}.")
+            elif stream is None:
+                # Offline: retarget and retry immediately. Selecting a
+                # source during an outage is the manual retry (the
+                # dashboard Retry button posts this same endpoint).
+                source = target
+                source_index = int(target) if target.isdigit() else None
+                source_label = (
+                    f"CAM-{int(target) + 1:02d}" if source_index is not None
+                    else ("IP-CAM" if target.startswith(("http://", "https://", "rtsp://"))
+                          else (Path(target).name or "VIDEO"))
+                )
+                reconnect_attempts = 0
+                next_reconnect_at = time.monotonic()
+                camera_status = "RECONNECTING"
+                last_offline_publish = 0.0
+                print(f"\n[INFO] Camera retry requested on source {safe_source(target)} ({source_label}).")
+                recent_events.append(_camera_event(
+                    "camera_switch", "Camera retry requested",
+                    detail=f"{source_label} selected while offline"))
+            else:
+                new_stream, err, _flag = _open_live_stream(target, camera_config)
+                if new_stream is None:
+                    print(f"\n[ERROR] Camera switch to source {safe_source(target)} failed: {err}"
+                          f" — keeping {source_label}.")
+                    recent_events.append(_camera_event(
+                        "camera_switch", "Camera switch failed",
+                        detail=f"Source {safe_source(target)}: {err}", severity="warn"))
+                else:
+                    stream.release()
+                    stream = new_stream
+                    last_gen = None
+                    source = target
+                    source_index = int(target) if target.isdigit() else None
+                    source_label = (
+                        f"CAM-{int(target) + 1:02d}" if source_index is not None
+                        else (Path(target).name or "VIDEO")
+                    )
+                    cam_w, cam_h = (stream.frame_w or cam_w), (stream.frame_h or cam_h)
+                    disp_w, disp_h, coord_scale = _display_dims(camera_config, cam_w, cam_h)
+                    print(f"\n[INFO] Camera switched to source {safe_source(target)} ({source_label}).")
+                    recent_events.append(_camera_event(
+                        "camera_switch", "Camera source changed",
+                        detail=f"{source_label} selected"))
+        elif action == "rotate":
+            camera_config = load_camera_config(camera_config.path or DEFAULT_CAMERA_CONFIG_PATH)
+            rot = normalize_rotation(payload.get("rotation", 0))
+            if is_image:
+                frame_img = cv2.imread(str(source))
+                if frame_img is None:
+                    print("\n[ERROR] Rotation change could not re-read the image source.")
+                else:
+                    if rot:
+                        frame_img = rotate_frame(frame_img, rot)
+                    image = frame_img
+                    cam_w, cam_h = image.shape[1], image.shape[0]
+                    disp_w, disp_h, coord_scale = _display_dims(camera_config, cam_w, cam_h)
+            elif stream is not None:
+                old_rot = stream.rotation
+                stream.set_rotation(rot)
+                if stream.native_w and stream.native_h:
+                    cam_w, cam_h = rotated_size(stream.native_w, stream.native_h, rot)
+                    disp_w, disp_h, coord_scale = _display_dims(camera_config, cam_w, cam_h)
+                print(f"\n[INFO] Image rotation set to {rot}° (was {old_rot}°) — "
+                      "calibration rotated with the frame.")
+            else:
+                # Offline: rotation lives in camera_config (persisted by
+                # the endpoint) and is applied when the source reopens.
+                print(f"\n[INFO] Image rotation set to {rot}° — applies when the camera reconnects.")
+            recent_events.append(_camera_event(
+                "camera_rotation", "Image rotation changed",
+                detail=f"{rot} degrees clockwise" if rot else "No rotation (camera upright)"))
+
+        # ── Camera offline: bounded reconnect supervisor ──────────────
+        if stream is None:
+            now_m = time.monotonic()
+            if (reconnect_attempts < CAMERA_MAX_RECONNECT_ATTEMPTS
+                    and now_m >= next_reconnect_at):
+                reconnect_attempts += 1
+                new_stream, err, _flag = _open_live_stream(source, camera_config)
+                if new_stream is None:
+                    if reconnect_attempts >= CAMERA_MAX_RECONNECT_ATTEMPTS:
+                        camera_status = "OFFLINE"
+                        msg = (
+                            f"Camera unavailable after {reconnect_attempts} attempts: {err}. "
+                            "Automatic retry stopped; select a camera source in the "
+                            "dashboard to retry manually."
+                        )
+                        print(f"\n[ERROR] {msg}")
+                        recent_events.append(_camera_event(
+                            "camera_reconnect", "Camera unavailable",
+                            detail=msg, severity="warn"))
+                    else:
+                        camera_status = "RECONNECTING"
+                        backoff = CAMERA_RECONNECT_BACKOFF_S[
+                            min(reconnect_attempts - 1, len(CAMERA_RECONNECT_BACKOFF_S) - 1)]
+                        next_reconnect_at = time.monotonic() + backoff
+                        print(f"\n[WARN] Camera reconnect attempt "
+                              f"{reconnect_attempts}/{CAMERA_MAX_RECONNECT_ATTEMPTS} failed: "
+                              f"{err} — retrying in {backoff:.0f}s.")
+                else:
+                    stream = new_stream
+                    last_gen = None
+                    reconnect_attempts = 0
+                    camera_status = "OK"
+                    cam_w, cam_h = (stream.frame_w or cam_w), (stream.frame_h or cam_h)
+                    disp_w, disp_h, coord_scale = _display_dims(camera_config, cam_w, cam_h)
+                    print(f"\n[INFO] Camera reconnected on source {safe_source(source)} ({source_label}).")
+                    recent_events.append(_camera_event(
+                        "camera_reconnect", "Camera reconnected",
+                        detail=f"{source_label} delivering frames again"))
+
+            # Keep the API honest at ~1 Hz while no frames flow: the
+            # snapshot carries the frozen last-known reading (or explicit
+            # DATA_UNAVAILABLE), the real last-frame age, and the current
+            # camera status. Nothing is recomputed from missing frames.
+            if time.time() - last_offline_publish >= CAMERA_OFFLINE_PUBLISH_INTERVAL_S:
+                offline_system = _offline_system_metrics(
+                    last_system, camera_status, camera_config, source_label, source_index)
+                _publish_camera_offline(camera_config, offline_system, recent_events,
+                                        last_analytics_snap)
+                last_offline_publish = time.time()
+
+            if not headless:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    print("\n[INFO] Quit by user.")
+                    break
+            else:
+                time.sleep(0.05)
+            continue
+
+        # ── Frame acquisition ─────────────────────────────────────────
         frame, gen = stream.read()
-        if frame is None:
+        if frame is None and not is_live_source(source):
             print("\n[INFO] End of video stream.")
             break
-        if gen == last_gen:
-            # No new frame yet — keep the GUI event loop alive anyway so
-            # the window keeps repainting while we wait for the camera.
+        if frame is None or gen == last_gen:
+            # No new frame this tick — keep the GUI event loop alive so
+            # the window keeps repainting while we wait for the camera,
+            # and watch for a live source that went quiet: a wedged
+            # device stops delivering without ever failing a read, and a
+            # dead one surfaces here as (None, -1).
             if shutdown_requested():
                 print("\n[INFO] Shutdown requested -- stopping the detection loop.")
                 break
+            lost = None
+            if is_live_source(source):
+                if frame is None:
+                    lost = "frame read failed"
+                elif (stream.last_frame_unix > 0
+                      and time.time() - stream.last_frame_unix > CAMERA_STALL_TIMEOUT_S):
+                    lost = f"no new frame for {CAMERA_STALL_TIMEOUT_S:.0f}s"
+            if lost is not None:
+                print(f"\n[WARN] Camera lost on source {safe_source(source)}: {lost} — "
+                      f"starting bounded reconnect.")
+                recent_events.append(_camera_event(
+                    "camera_reconnect", "Camera signal lost",
+                    detail=f"{source_label}: {lost}; reconnecting "
+                           f"(max {CAMERA_MAX_RECONNECT_ATTEMPTS} attempts)",
+                    severity="warn"))
+                stream.release()
+                stream = None
+                camera_status = "RECONNECTING"
+                reconnect_attempts = 0
+                next_reconnect_at = time.monotonic()
+                last_offline_publish = 0.0
+                frame, last_gen = None, None
+                continue
             if not headless:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
@@ -1080,9 +1500,14 @@ def run_detection(source=0, camera_config=None, detect_mode=None,
             source_label=source_label,
             rotation_deg=camera_config.rotation,
             frame_w=frame.shape[1], frame_h=frame.shape[0],
+            camera_status=camera_status,
         )
         dash = build_dashboard_model(snap, system, camera_config, recent_events)
         series.append(frame_count, dash.queue)
+        # Frozen models for the offline snapshot: while the camera is down
+        # the last real reading is held (never recomputed from no frames).
+        last_analytics_snap = snap
+        last_system = system
 
         # Visualization layer: resize to the display frame FIRST, then draw
         # the dashboard (or legacy HUD) directly on it (native→display
@@ -1168,100 +1593,6 @@ def run_detection(source=0, camera_config=None, detect_mode=None,
             print(console_line, flush=True)
             last_console_log = time.time()
 
-        # Hot-reload requested by the API (e.g. PUT /api/dashboard/mapping).
-        # Same path as the 'r' key below; the per-track crossing state is
-        # reset so no stale side memory survives the geometry swap, and a
-        # failed update never reaches here because the endpoint only
-        # signals after a validated atomic persist.
-        reload_source = consume_config_reload()
-        if reload_source:
-            camera_config = load_camera_config(camera_config.path or DEFAULT_CAMERA_CONFIG_PATH)
-            analytics.config = camera_config
-            analytics.reset_mapping()
-            print(
-                f"\n[INFO] Config reloaded via {reload_source} — "
-                f"mapping active: {camera_config.mapping_active}, "
-                f"ref: {getattr(getattr(camera_config, 'mapping', None), 'reference_point', 'n/a')}"
-            )
-
-        # Camera control (source switch / rotation) requested via the API
-        # (POST /api/dashboard/camera/*). Mirrors the reload path: the
-        # endpoints validate and persist first, so a failed update never
-        # reaches this point. Rotation is one lane-level setting: it stays
-        # in effect across a source switch and can be re-set afterwards.
-        action, payload, ctl_src = consume_camera_control()
-        if action == "switch":
-            camera_config = load_camera_config(camera_config.path or DEFAULT_CAMERA_CONFIG_PATH)
-            target = str(payload.get("source", ""))
-            if not target:
-                print("[WARN] Camera switch request without a source — ignored.")
-            elif str(source) == target:
-                print(f"\n[INFO] Camera switch ignored — already on source {target}.")
-            else:
-                try:
-                    new_stream = FrameStream(
-                        target,
-                        width=camera_config.width,
-                        height=camera_config.height,
-                        rotation=camera_config.rotation,
-                    ).start()
-                    # Wait for the first delivered frame, otherwise the
-                    # next read below can see (None, gen) and be mistaken
-                    # for the end of a video file — killing the loop.
-                    first_frame, _ = new_stream.read()
-                    first_deadline = time.monotonic() + 10.0
-                    while first_frame is None and time.monotonic() < first_deadline:
-                        time.sleep(0.01)
-                        first_frame, _ = new_stream.read()
-                    if first_frame is None:
-                        raise ValueError(f"camera {target} delivers no frames")
-                except (ValueError, OSError) as exc:
-                    print(f"\n[ERROR] Camera switch to source {target} failed: {exc}"
-                          f" — keeping {source_label}.")
-                    recent_events.append(_camera_event(
-                        "camera_switch", "Camera switch failed",
-                        detail=f"Source {target}: {exc}", severity="warn"))
-                else:
-                    stream.release()
-                    stream = new_stream
-                    last_gen = None
-                    source = target
-                    source_index = int(target) if target.isdigit() else None
-                    source_label = (
-                        f"CAM-{int(target) + 1:02d}" if source_index is not None
-                        else (Path(target).name or "VIDEO")
-                    )
-                    cam_w, cam_h = (stream.frame_w or cam_w), (stream.frame_h or cam_h)
-                    disp_w, disp_h, coord_scale = _display_dims(camera_config, cam_w, cam_h)
-                    print(f"\n[INFO] Camera switched to source {target} ({source_label}).")
-                    recent_events.append(_camera_event(
-                        "camera_switch", "Camera source changed",
-                        detail=f"{source_label} selected"))
-        elif action == "rotate":
-            camera_config = load_camera_config(camera_config.path or DEFAULT_CAMERA_CONFIG_PATH)
-            rot = normalize_rotation(payload.get("rotation", 0))
-            if is_image:
-                frame_img = cv2.imread(str(source))
-                if frame_img is None:
-                    print("\n[ERROR] Rotation change could not re-read the image source.")
-                else:
-                    if rot:
-                        frame_img = rotate_frame(frame_img, rot)
-                    image = frame_img
-                    cam_w, cam_h = image.shape[1], image.shape[0]
-                    disp_w, disp_h, coord_scale = _display_dims(camera_config, cam_w, cam_h)
-            else:
-                old_rot = stream.rotation
-                stream.set_rotation(rot)
-                if stream.native_w and stream.native_h:
-                    cam_w, cam_h = rotated_size(stream.native_w, stream.native_h, rot)
-                    disp_w, disp_h, coord_scale = _display_dims(camera_config, cam_w, cam_h)
-                print(f"\n[INFO] Image rotation set to {rot}° (was {old_rot}°) — "
-                      "calibration rotated with the frame.")
-            recent_events.append(_camera_event(
-                "camera_rotation", "Image rotation changed",
-                detail=f"{rot} degrees clockwise" if rot else "No rotation (camera upright)"))
-
         if not headless:
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -1288,7 +1619,8 @@ def run_detection(source=0, camera_config=None, detect_mode=None,
             else:
                 next_frame_time = time.monotonic()
 
-    stream.release()
+    if stream is not None:
+        stream.release()
     if recorder is not None:
         recorder.close()
         print(f"[INFO] Occupancy samples written: {recorder.rows} -> {recorder.path}")
@@ -1300,10 +1632,12 @@ def run_detection(source=0, camera_config=None, detect_mode=None,
     print(f"[INFO]   Tracking   : {trk_ms:6.1f} ms/frame")
     print(f"[INFO]   Analytics  : {anl_ms:6.1f} ms/frame")
     print(f"[INFO]   Display    : {disp_ms:6.1f} ms/frame (draw + resize + imshow)")
-    if stream.delivered_fps > 0:
+    if stream is not None and stream.delivered_fps > 0:
         print(f"[INFO]   Source FPS : {stream.delivered_fps:6.1f} (measured)"
               f"  requested {stream.requested_fps:.0f}"
               f"  reported {stream.reported_fps:.1f}")
+    elif camera_status != "OK":
+        print(f"[INFO]   Source FPS : unavailable (camera {camera_status})")
     print("[INFO] Detection stopped.")
 
 
