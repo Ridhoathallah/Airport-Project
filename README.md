@@ -105,7 +105,6 @@ Accuracy gates and manual scenarios: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 | [docs/API.md](docs/API.md) | Endpoint reference and data models |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `camera.yaml` + mapping schema |
 | [docs/DATASETS.md](docs/DATASETS.md) | Dataset, training, and evaluation workflow |
-| [AGENTS.md](AGENTS.md) | Instructions for AI coding agents |
 
 ## Scope Boundaries
 
@@ -142,7 +141,6 @@ git push -u origin feature/<name>
 
 Run the project's checks before opening a PR — the commands are in
 [Verify an Installation](#verify-an-installation). Coding-agent guidance and
-required gates: [AGENTS.md](AGENTS.md). No `.env` file is needed; all runtime
 values are flags and YAML config (`docs/CONFIGURATION.md`).
 
 ---
