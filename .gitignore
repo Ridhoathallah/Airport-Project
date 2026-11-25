@@ -105,3 +105,10 @@ id_rsa*
 *.db-shm
 *.sqlite
 *.sqlite3
+
+# Local AI agent instructions
+AGENTS.md
+CLAUDE.md
+.cursorrules
+.opencode/
+.claude/
